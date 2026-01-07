@@ -569,6 +569,80 @@
   }
 
   /**
+   * Best-effort direct fetch for ChatGPT conversation JSON.
+   * This is often the most reliable way to get the full history without DOM scrolling.
+   * Uses same-origin credentials (no paid API).
+   * @param {string} convId
+   * @returns {Promise<Array<any>>} messages in extension format
+   */
+  async function tryFetchChatGPTConversation(convId) {
+    try {
+      const id = String(convId || '').trim();
+      if (!id) return [];
+      const provider = getProvider();
+      if (provider !== 'chatgpt') return [];
+
+      const endpoints = [`/backend-api/conversation/${encodeURIComponent(id)}`];
+      for (const ep of endpoints) {
+        try {
+          const url = `${location.origin}${ep}`;
+          log('ChatGPT deep fetch: trying endpoint', { url });
+          const res = await fetch(url, {
+            credentials: 'include',
+            headers: { Accept: 'application/json' }
+          });
+          if (!res.ok) {
+            log('ChatGPT deep fetch: endpoint not ok', { url, status: res.status });
+            continue;
+          }
+          const json = await res.json();
+          const extracted = extractMessagesFromAnyJson(json);
+          if (!extracted.length) {
+            log('ChatGPT deep fetch: no messages extracted', { url });
+            continue;
+          }
+
+          const sessionId = await ensureSessionId();
+          const nowIso = new Date().toISOString();
+          const out = extracted.map((m, idx) => ({
+            id: `msg-${idx + 1}`,
+            role: m.role,
+            content: m.content,
+            timestamp: typeof m.timestamp === 'string' ? m.timestamp : nowIso,
+            session_id: sessionId,
+            captured_at: Date.now(),
+            source: 'chatgpt_backend_api',
+            source_url: url
+          }));
+
+          // Cache in memory (best fidelity, avoids storage quota).
+          apiMessagesCache = out;
+          if (apiMessagesCache.length > MAX_API_CACHE_MESSAGES) {
+            apiMessagesCache = apiMessagesCache.slice(-MAX_API_CACHE_MESSAGES);
+          }
+
+          // Store a bounded subset for debugging.
+          const approxChars = apiMessagesCache.reduce((acc, mm) => acc + (mm.content ? mm.content.length : 0), 0);
+          const bounded = approxChars > MAX_STORAGE_MESSAGE_CHARS ? apiMessagesCache.slice(-300) : apiMessagesCache;
+          await chrome.storage.local.set({
+            [STORAGE_KEYS.API_MESSAGES]: bounded,
+            [STORAGE_KEYS.API_EVENTS]: apiEvents
+          });
+
+          log('ChatGPT deep fetch: success', { messages: out.length, stored: bounded.length, approxChars });
+          return out;
+        } catch (e) {
+          logError('ChatGPT deep fetch: endpoint failed', { endpoint: ep, error: e?.message || String(e) });
+          // try next endpoint
+        }
+      }
+      return [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /**
    * Directly fetch a public share snapshot JSON (best source of truth).
    * Improved to try multiple endpoints and better handle Claude.ai format.
    * This is NOT a paid API call; it's the same endpoint the share page uses.
@@ -1274,6 +1348,7 @@
   async function deepCaptureConversation() {
     const start = Date.now();
     const provider = getProvider();
+    const maxMs = provider === 'chatgpt' ? Math.max(DEEP_CAPTURE_MAX_MS, 60000) : DEEP_CAPTURE_MAX_MS;
     const scroller = getConversationScrollContainer(provider);
     const startY = scroller ? scroller.scrollTop : window.scrollY;
     let lastAdded = -1;
@@ -1294,7 +1369,7 @@
     await sleep(350);
     await scanAndSyncMessages('deep-top', { append: true });
 
-    while (Date.now() - start < DEEP_CAPTURE_MAX_MS) {
+    while (Date.now() - start < maxMs) {
       const y = scroller ? scroller.scrollTop : window.scrollY;
       const my = maxY();
       if (y >= my - 2) {
@@ -1474,8 +1549,10 @@
   async function hydrateChatHistory(scroller, reason = 'hydrate') {
     const start = Date.now();
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    const waitMs = DEEP_HYDRATE_WAIT_MS;
-    const maxNoGrowth = 4;
+    const provider = getProvider();
+    const waitMs = provider === 'chatgpt' ? Math.max(DEEP_HYDRATE_WAIT_MS, 2500) : DEEP_HYDRATE_WAIT_MS;
+    const maxNoGrowth = provider === 'chatgpt' ? 10 : 4;
+    const maxMs = provider === 'chatgpt' ? Math.max(DEEP_HYDRATE_MAX_MS, 180000) : DEEP_HYDRATE_MAX_MS;
     let noGrowth = 0;
 
     const getScrollHeight = () =>
@@ -1540,7 +1617,7 @@
       prevMsgCount
     });
 
-    while (Date.now() - start < DEEP_HYDRATE_MAX_MS && noGrowth < maxNoGrowth) {
+    while (Date.now() - start < maxMs && noGrowth < maxNoGrowth) {
       scrollUpPulse();
       // Wait for DOM mutation (better than fixed sleep). Fallback to timeout.
       await new Promise((resolve) => {
@@ -2009,6 +2086,12 @@
         // Non-share pages: optionally deep capture (scroll) or normal scan (uses storage + interceptor cache).
         const capturePromise = wantsDeep
           ? (async () => {
+              // ChatGPT: first try direct backend conversation fetch (often returns full history instantly).
+              if (provider === 'chatgpt') {
+                const convId = getConversationIdFromUrl();
+                const direct = await tryFetchChatGPTConversation(convId);
+                if (direct && direct.length) return;
+              }
               // Hydrate first for reverse infinite scroll UIs (Gemini + ChatGPT).
               const scroller = getConversationScrollContainer(provider);
               if (provider === 'gemini' || provider === 'chatgpt') {
