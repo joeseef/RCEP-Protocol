@@ -20,6 +20,7 @@ RCEP™ packages encode *portable cognitive state*:
 ![Architecture layers](docs/diagrams/layers.svg)
 
 ## Protocol docs
+- `docs/DESIGN_SYSTEM.md` (frozen visual language)
 - `docs/WHITEPAPER.md` (conceptual + threat model)
 - `docs/SPECIFICATION.md` (normative MUST/SHOULD)
 - `docs/SECURITY_MODEL.md` (what is / isn’t guaranteed)

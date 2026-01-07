@@ -1,15 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="980" height="560" viewBox="0 0 980 560">
   <defs>
     <style>
-      .bg{fill:#0b0614}
-      .box{fill:rgba(255,255,255,0.04);stroke:rgba(255,255,255,0.18);stroke-width:1.2}
+      .bg{fill:#05050A}
+      .box{fill:rgba(255,255,255,0.03);stroke:rgba(244,233,232,0.14);stroke-width:1.2}
       .title{fill:#ffffff;font-family:ui-sans-serif,system-ui,Inter,Segoe UI,Arial;font-size:18px;font-weight:700}
       .text{fill:rgba(255,255,255,0.78);font-family:ui-sans-serif,system-ui,Inter,Segoe UI,Arial;font-size:14px}
       .mono{fill:rgba(255,255,255,0.86);font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:13px}
-      .arrow{stroke:rgba(168,85,247,0.9);stroke-width:2;marker-end:url(#m)}
+      .arrow{stroke:rgba(244,233,232,0.92);stroke-width:2;marker-end:url(#m)}
     </style>
     <marker id="m" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
-      <path d="M0,0 L10,3 L0,6 Z" fill="rgba(168,85,247,0.9)"/>
+      <path d="M0,0 L10,3 L0,6 Z" fill="rgba(244,233,232,0.92)"/>
     </marker>
   </defs>
   <rect class="bg" x="0" y="0" width="980" height="560" rx="24"/>
