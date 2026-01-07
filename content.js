@@ -19,7 +19,10 @@
     CLAUDE_ASSISTANT_MESSAGE: '.font-claude-message',
     CLAUDE_ROLE_ATTR: '[data-is-user-message]',
     // ChatGPT
-    CHATGPT_MESSAGE_NODES: '[data-message-author-role]',
+    // ChatGPT UI variants:
+    // - Modern: elements with data-message-author-role
+    // - Some variants wrap turns in <article data-testid="conversation-turn-*">
+    CHATGPT_MESSAGE_NODES: '[data-message-author-role], article[data-testid^="conversation-turn-"]',
     CHATGPT_ROLE_ATTR: '[data-message-author-role]',
     // Gemini (forensically validated selectors)
     // Note: Gemini often uses custom elements like <user-query> / <model-response>.
@@ -1013,9 +1016,15 @@
       const provider = getProvider();
 
       if (provider === 'chatgpt') {
+        // Direct attribute
         const r = el.getAttribute && el.getAttribute('data-message-author-role');
         if (r === 'user') return 'user';
         if (r === 'assistant') return 'assistant';
+        // Wrapped turn (<article ...>) → find a descendant with the role attribute
+        const inner = el.querySelector?.(SELECTORS.CHATGPT_ROLE_ATTR);
+        const r2 = inner && inner.getAttribute ? inner.getAttribute('data-message-author-role') : null;
+        if (r2 === 'user') return 'user';
+        if (r2 === 'assistant') return 'assistant';
       }
       if (provider === 'gemini') {
         // Use closest() so we can pass either container or descendants.
@@ -1410,6 +1419,7 @@
         if (!(el instanceof HTMLElement)) continue;
         if (!isScrollableEl(el)) continue;
 
+        const sh = el.scrollHeight || 0;
         let msgCount = 0;
         if (sel) {
           try {
