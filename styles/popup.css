@@ -87,7 +87,8 @@ header {
   height: 46px;
   flex-shrink: 0;
   border-radius: 14px;
-  background: linear-gradient(180deg, rgba(255, 245, 245, 0.98), rgba(255, 229, 229, 0.96));
+  /* Brand background (requested) */
+  background: #F4E9E8;
   border: 1px solid rgba(255, 255, 255, 0.10);
   box-shadow:
     0 14px 30px rgba(0, 0, 0, 0.45),
@@ -95,13 +96,17 @@ header {
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
 }
 
 .logo-img {
-  width: 30px;
-  height: 30px;
+  width: 32px;
+  height: 32px;
   display: block;
   object-fit: contain;
+  /* If the source PNG has a light background, this makes it visually disappear on #F4E9E8 */
+  mix-blend-mode: multiply;
+  image-rendering: auto;
 }
 
 .header-text {
