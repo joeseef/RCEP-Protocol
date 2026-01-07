@@ -2,6 +2,16 @@
 
 (() => {
   const LOG_PREFIX = '[RL4]';
+  // Tell the background worker which provider tab we are (so RL4 UI can target the right page even
+  // when opened in a detached window).
+  try {
+    chrome.runtime.sendMessage({ action: 'rl4_supported_tab_ping', url: location.href }, () => {});
+    setTimeout(() => {
+      try {
+        chrome.runtime.sendMessage({ action: 'rl4_supported_tab_ping', url: location.href }, () => {});
+      } catch (_) {}
+    }, 1500);
+  } catch (_) {}
   const STORAGE_KEYS = {
     CURRENT_SESSION_ID: 'rl4_current_session_id',
     CURRENT_CONV_ID: 'rl4_current_conv_id',
@@ -9,7 +19,12 @@
     CURRENT_UPDATED_AT: 'rl4_current_updated_at',
     SESSIONS_INDEX: 'rl4_sessions_index',
     API_MESSAGES: 'rl4_api_messages',
-    API_EVENTS: 'rl4_api_events'
+    API_EVENTS: 'rl4_api_events',
+    CAPTURE_PROGRESS: 'rl4_capture_progress_v1',
+    LAST_SNAPSHOT: 'rl4_last_snapshot_v1',
+    // RL4 Blocks Encoder capture (semi-assisted workflow)
+    RL4_BLOCKS: 'rl4_blocks_v1',
+    RL4_BLOCKS_STATUS: 'rl4_blocks_status_v1'
   };
 
   const SELECTORS = {
@@ -45,7 +60,9 @@
   // chrome.storage.local quota is typically ~5MB. Keep plenty of headroom.
   // For full-fidelity share snapshots, prefer in-memory transfer to popup.
   const MAX_STORAGE_MESSAGE_CHARS = 1_800_000;
-  const MAX_API_CACHE_MESSAGES = 2000; // in-memory safety cap (still large enough for most shares)
+  const MAX_API_CACHE_MESSAGES = 50_000; // fidelity-first: allow very large chats (guarded below)
+  const MAX_API_CACHE_TOTAL_CHARS = 12_000_000; // stop accumulating beyond ~12MB of message text
+  const MAX_SINGLE_MESSAGE_CHARS = 30_000; // per-message cap to avoid runaway memory
 
   let observer = null;
   let debounceTimer = null;
@@ -53,6 +70,484 @@
   let apiMessagesCache = [];
   let lastPathname = null;
   let deepCaptureInProgress = false;
+  let captureIdActive = null;
+  let chatgptChunkSeen = new Set();
+  let lastProgressWriteAt = 0;
+  let snapshotJobRunning = false;
+  let jobTabId = null;
+  let jobStrategy = null; // 'chatgpt_surgical' | 'dom'
+  let progressHeartbeatTimer = null;
+  let inpageUiMounted = false;
+  let inpageUiOpen = false;
+
+  function startProgressHeartbeat() {
+    stopProgressHeartbeat();
+    progressHeartbeatTimer = setInterval(() => {
+      // Keep CAPTURE_PROGRESS.updatedAt moving even if the UI isn't adding messages every tick.
+      if (!captureIdActive) return;
+      setCaptureProgress({}).catch(() => {});
+    }, 2000);
+  }
+
+  function stopProgressHeartbeat() {
+    if (progressHeartbeatTimer) clearInterval(progressHeartbeatTimer);
+    progressHeartbeatTimer = null;
+  }
+
+  function mountInpageWidget() {
+    try {
+      if (inpageUiMounted) return;
+      if (!document || !document.documentElement) return;
+
+      const root = document.createElement('div');
+      root.id = 'rl4-inpage-root';
+      root.style.position = 'fixed';
+      root.style.right = '16px';
+      root.style.bottom = '16px';
+      root.style.zIndex = '2147483647';
+      root.style.fontFamily =
+        'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"';
+
+      const launcher = document.createElement('button');
+      launcher.type = 'button';
+      launcher.setAttribute('aria-label', 'Open RL4');
+      launcher.style.all = 'unset';
+      launcher.style.cursor = 'pointer';
+      launcher.style.width = '48px';
+      launcher.style.height = '48px';
+      launcher.style.borderRadius = '999px';
+      launcher.style.display = 'grid';
+      launcher.style.placeItems = 'center';
+      // Match popup branding: full round background in #F2E7E5.
+      // Use setProperty(..., 'important') to resist aggressive host page CSS.
+      launcher.style.setProperty('background', '#F2E7E5', 'important');
+      launcher.style.setProperty('background-color', '#F2E7E5', 'important');
+      launcher.style.backdropFilter = 'blur(10px)';
+      launcher.style.boxShadow =
+        '0 10px 30px rgba(0,0,0,.25), 0 0 0 1px rgba(15,23,42,.10), 0 0 28px rgba(99,102,241,.22)';
+      launcher.style.border = '1px solid rgba(15,23,42,.10)';
+      launcher.style.userSelect = 'none';
+      launcher.style.transition = 'transform .12s ease, box-shadow .2s ease';
+
+      // Subtle glow / pulse to make it feel "alive" (CSM-style).
+      const styleId = 'rl4-inpage-style';
+      if (!document.getElementById(styleId)) {
+        const st = document.createElement('style');
+        st.id = styleId;
+        st.textContent =
+          '@keyframes rl4Pulse{0%{box-shadow:0 10px 30px rgba(0,0,0,.25),0 0 0 1px rgba(15,23,42,.10),0 0 22px rgba(99,102,241,.20)}50%{box-shadow:0 10px 30px rgba(0,0,0,.25),0 0 0 1px rgba(15,23,42,.12),0 0 34px rgba(99,102,241,.38)}100%{box-shadow:0 10px 30px rgba(0,0,0,.25),0 0 0 1px rgba(15,23,42,.10),0 0 22px rgba(99,102,241,.20)}}';
+        document.documentElement.appendChild(st);
+      }
+      launcher.style.animation = 'rl4Pulse 2.2s ease-in-out infinite';
+
+      // Wrap the logo to protect it from host page CSS (some sites apply aggressive img rules).
+      const iconWrap = document.createElement('div');
+      iconWrap.style.width = '30px';
+      iconWrap.style.height = '30px';
+      iconWrap.style.display = 'grid';
+      iconWrap.style.placeItems = 'center';
+      iconWrap.style.borderRadius = '8px';
+      iconWrap.style.overflow = 'hidden';
+
+      const img = document.createElement('img');
+      img.alt = 'RL4';
+      const rawIconUrl = chrome.runtime.getURL('assets/rl4-launcher.png');
+      img.src = rawIconUrl;
+      // Force square box + keep aspect ratio (prevents "squashed" rendering).
+      img.style.setProperty('width', '30px', 'important');
+      img.style.setProperty('height', '30px', 'important');
+      img.style.setProperty('object-fit', 'contain', 'important');
+      img.style.setProperty('object-position', 'center', 'important');
+      img.style.setProperty('display', 'block', 'important');
+      img.style.setProperty('max-width', '30px', 'important');
+      img.style.setProperty('max-height', '30px', 'important');
+      img.style.setProperty('background', 'transparent', 'important');
+
+      iconWrap.appendChild(img);
+      launcher.appendChild(iconWrap);
+
+      const panel = document.createElement('div');
+      panel.id = 'rl4-inpage-panel';
+      panel.style.position = 'fixed';
+      panel.style.right = '16px';
+      panel.style.bottom = '76px';
+      panel.style.width = '420px';
+      panel.style.height = '720px';
+      panel.style.maxWidth = 'min(92vw, 520px)';
+      panel.style.maxHeight = 'min(88vh, 820px)';
+      panel.style.background = 'transparent';
+      panel.style.borderRadius = '16px';
+      panel.style.overflow = 'hidden';
+      panel.style.boxShadow = '0 20px 60px rgba(0,0,0,.30)';
+      panel.style.display = 'none';
+
+      const iframe = document.createElement('iframe');
+      iframe.title = 'RL4';
+      iframe.src = chrome.runtime.getURL('popup.html');
+      iframe.style.width = '100%';
+      iframe.style.height = '100%';
+      iframe.style.border = '0';
+      iframe.style.borderRadius = '16px';
+      iframe.setAttribute('allow', 'clipboard-write');
+      panel.appendChild(iframe);
+
+      const setOpen = (open) => {
+        inpageUiOpen = !!open;
+        panel.style.display = inpageUiOpen ? 'block' : 'none';
+      };
+
+      launcher.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setOpen(!inpageUiOpen);
+      });
+      launcher.addEventListener('mouseenter', () => {
+        launcher.style.transform = 'translateY(-1px) scale(1.03)';
+        launcher.style.boxShadow =
+          '0 14px 36px rgba(0,0,0,.28), 0 0 0 1px rgba(15,23,42,.12), 0 0 38px rgba(99,102,241,.42)';
+      });
+      launcher.addEventListener('mouseleave', () => {
+        launcher.style.transform = 'none';
+        launcher.style.boxShadow =
+          '0 10px 30px rgba(0,0,0,.25), 0 0 0 1px rgba(15,23,42,.10), 0 0 28px rgba(99,102,241,.22)';
+      });
+
+      root.appendChild(panel);
+      root.appendChild(launcher);
+      document.documentElement.appendChild(root);
+      inpageUiMounted = true;
+      inpageUiOpen = false;
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function openInpagePanel() {
+    mountInpageWidget();
+    try {
+      const panel = document.getElementById('rl4-inpage-panel');
+      if (panel) panel.style.display = 'block';
+      inpageUiOpen = true;
+    } catch (_) {}
+  }
+
+  // --- RL4 Blocks capture (semi-assisted, cross-LLM safe) ---
+  let rl4BlocksArmed = false;
+  let rl4BlocksCaptured = false;
+  let lastRl4BlocksScanAt = 0;
+
+  async function setCaptureProgress(patch) {
+    try {
+      const prevRes = await chrome.storage.local.get([STORAGE_KEYS.CAPTURE_PROGRESS]);
+      const prev = prevRes && prevRes[STORAGE_KEYS.CAPTURE_PROGRESS] && typeof prevRes[STORAGE_KEYS.CAPTURE_PROGRESS] === 'object'
+        ? prevRes[STORAGE_KEYS.CAPTURE_PROGRESS]
+        : {};
+      const next = {
+        ...prev,
+        ...patch,
+        updatedAt: Date.now()
+      };
+      await chrome.storage.local.set({ [STORAGE_KEYS.CAPTURE_PROGRESS]: next });
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  async function emitCaptureProgress(patch, force = false) {
+    const now = Date.now();
+    if (!force && now - lastProgressWriteAt < 250) return;
+    lastProgressWriteAt = now;
+    await setCaptureProgress(patch);
+  }
+
+  async function clearCaptureProgress() {
+    try {
+      await chrome.storage.local.remove([STORAGE_KEYS.CAPTURE_PROGRESS]);
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  async function saveLastSnapshot(snapshot) {
+    try {
+      if (!snapshot || typeof snapshot !== 'object') return;
+      // Avoid storing huge payloads (e.g., full transcripts on big chats)
+      const s = JSON.stringify(snapshot);
+      if (s.length > 1_500_000) return;
+      await chrome.storage.local.set({ [STORAGE_KEYS.LAST_SNAPSHOT]: snapshot });
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  // --- Device-only tamper seal (copied from popup.js to allow background jobs) ---
+  function arrayBufferToBase64(buf) {
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
+  async function sha256HexBytes(bytes) {
+    const hash = await crypto.subtle.digest('SHA-256', bytes);
+    const arr = Array.from(new Uint8Array(hash));
+    return arr.map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function openKeyDb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('rl4_device_keys', 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('keys')) {
+          db.createObjectStore('keys', { keyPath: 'id' });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error('Failed to open IndexedDB'));
+    });
+  }
+
+  async function idbGet(db, storeName, key) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readonly');
+      const store = tx.objectStore(storeName);
+      const req = store.get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error || new Error('IndexedDB get failed'));
+    });
+  }
+
+  async function idbPut(db, storeName, value) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readwrite');
+      const store = tx.objectStore(storeName);
+      const req = store.put(value);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error || new Error('IndexedDB put failed'));
+    });
+  }
+
+  async function getOrCreateDeviceSigningKey() {
+    const db = await openKeyDb();
+    const rec = await idbGet(db, 'keys', 'device_signing_v1');
+    if (rec && rec.privateKey && rec.keyId && rec.publicKeySpkiB64) {
+      return { privateKey: rec.privateKey, keyId: rec.keyId, publicKeySpkiB64: rec.publicKeySpkiB64 };
+    }
+
+    const kp = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+    let publicKeySpkiB64 = '';
+    let keyId = 'unknown';
+    try {
+      const spki = await crypto.subtle.exportKey('spki', kp.publicKey);
+      publicKeySpkiB64 = arrayBufferToBase64(spki);
+      keyId = await sha256HexBytes(new Uint8Array(spki));
+    } catch (_) {
+      // ignore
+    }
+    await idbPut(db, 'keys', { id: 'device_signing_v1', privateKey: kp.privateKey, keyId, publicKeySpkiB64 });
+    return { privateKey: kp.privateKey, keyId, publicKeySpkiB64 };
+  }
+
+  async function signChecksumDeviceOnly(checksumHex) {
+    const checksum = String(checksumHex || '').trim();
+    if (!checksum) throw new Error('Missing checksum for signature.');
+    const { privateKey, keyId, publicKeySpkiB64 } = await getOrCreateDeviceSigningKey();
+    const payload = `checksum:${checksum}`;
+    const data = new TextEncoder().encode(payload);
+    const sigBuf = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, data);
+    const sigB64 = arrayBufferToBase64(sigBuf);
+    return {
+      type: 'device_integrity_v1',
+      algo: 'ECDSA_P256_SHA256',
+      key_id: keyId,
+      public_key_spki: publicKeySpkiB64,
+      signed_payload: payload,
+      value: sigB64
+    };
+  }
+
+  async function runSnapshotJob(options) {
+    const provider = getProvider();
+    const outputMode = options && typeof options.outputMode === 'string' ? options.outputMode : 'digest';
+    const wantsSeal = !!(options && options.wantsIntegritySeal);
+
+    // Guardrail: never include transcript in ultra modes, and auto-disable for huge chats.
+    let includeTranscript = !!(options && options.includeTranscript);
+    if (outputMode === 'ultra' || outputMode === 'ultra_plus') includeTranscript = false;
+
+    snapshotJobRunning = true;
+    startProgressHeartbeat();
+    try {
+      await emitCaptureProgress(
+        { captureId: captureIdActive, tabId: jobTabId, provider, phase: 'starting', status: 'starting', startedAt: Date.now() },
+        true
+      );
+
+      // Capture messages (same logic as getMessages deep capture, but decoupled from popup)
+      deepCaptureInProgress = true;
+      try {
+        if (provider === 'chatgpt') {
+          // Prefer Surgical Fetch for XXL chats: fastest + returns exact total for % progress.
+          const convId = getConversationIdFromUrl();
+          const surgical = await tryFetchChatGPTConversation(convId);
+          if (surgical && surgical.length) {
+            jobStrategy = 'chatgpt_surgical';
+            await emitCaptureProgress(
+              {
+                captureId: captureIdActive,
+                tabId: jobTabId,
+                provider,
+                strategy: jobStrategy,
+                phase: 'fetch',
+                phaseIndex: 1,
+                phaseTotal: 2,
+                status: 'capturing',
+                receivedMessages: surgical.length,
+                totalMessages: surgical.length
+              },
+              true
+            );
+            log('ChatGPT: using surgical fetch path', { messages: surgical.length });
+          } else {
+            // Fallbacks: embedded state + page-context request
+            jobStrategy = 'dom';
+          const embedded = await tryExtractChatGPTEmbeddedState();
+          if (!embedded || !embedded.length) {
+            await requestChatGPTConversationViaPageContext(convId);
+            const started = Date.now();
+            const before = Array.isArray(apiMessagesCache) ? apiMessagesCache.length : 0;
+            while (Date.now() - started < 12000) {
+              const nowLen = Array.isArray(apiMessagesCache) ? apiMessagesCache.length : 0;
+              if (nowLen > before + 50) break;
+              await new Promise((r) => setTimeout(r, 250));
+            }
+          }
+          }
+        } else {
+          jobStrategy = 'dom';
+        }
+
+        // Hydrate virtualized UIs for Gemini + ChatGPT (and still safe for others)
+        const scroller = getConversationScrollContainer(provider);
+        if (jobStrategy !== 'chatgpt_surgical') {
+          if (provider === 'gemini' || provider === 'chatgpt') {
+            // Phase 1/3 (DOM strategy): hydrate
+            await emitCaptureProgress(
+              {
+                captureId: captureIdActive,
+                tabId: jobTabId,
+                provider,
+                strategy: jobStrategy,
+                phase: 'hydrate',
+                phaseIndex: 1,
+                phaseTotal: 3,
+                status: 'capturing'
+              },
+              true
+            );
+            await hydrateChatHistory(scroller, 'hydrate');
+          }
+
+          // Phase 2/3 (DOM strategy): scan (scroll + accumulate)
+          await emitCaptureProgress(
+            {
+              captureId: captureIdActive,
+              tabId: jobTabId,
+              provider,
+              strategy: jobStrategy,
+              phase: 'scan',
+              phaseIndex: 2,
+              phaseTotal: 3,
+              status: 'capturing'
+            },
+            true
+          );
+          await deepCaptureConversation();
+        }
+
+      } finally {
+        deepCaptureInProgress = false;
+      }
+
+      // Pick best message source
+      const stored = await chrome.storage.local.get([STORAGE_KEYS.CURRENT_MESSAGES]);
+      const domMsgs = Array.isArray(stored[STORAGE_KEYS.CURRENT_MESSAGES]) ? stored[STORAGE_KEYS.CURRENT_MESSAGES] : [];
+      const apiMsgs = Array.isArray(apiMessagesCache) ? apiMessagesCache : [];
+      const messages = apiMsgs.length >= domMsgs.length ? apiMsgs : domMsgs;
+
+      // Auto-disable transcript for huge captures
+      try {
+        const approxChars = messages.reduce((acc, m) => acc + (m && m.content ? String(m.content).length : 0), 0);
+        if (messages.length > 1500 || approxChars > 1_200_000) includeTranscript = false;
+      } catch (_) {
+        includeTranscript = false;
+      }
+
+      const phaseTotal = jobStrategy === 'chatgpt_surgical' ? 2 : 3;
+      const phaseIndex = jobStrategy === 'chatgpt_surgical' ? 2 : 3;
+      await emitCaptureProgress(
+        {
+          captureId: captureIdActive,
+          tabId: jobTabId,
+          provider,
+          strategy: jobStrategy,
+          phase: 'snapshot',
+          phaseIndex,
+          phaseTotal,
+          status: 'generating',
+          receivedMessages: messages.length
+        },
+        true
+      );
+
+      if (typeof RL4SnapshotGenerator !== 'function') {
+        throw new Error('Snapshot generator not available in content script. Reload extension.');
+      }
+      const generator = new RL4SnapshotGenerator(messages, {}, { includeTranscript, outputMode });
+      const snapshot = await generator.generate();
+      // Attach capture provenance (debug/UX; does not change semantic content)
+      if (!snapshot.metadata || typeof snapshot.metadata !== 'object') snapshot.metadata = {};
+      snapshot.metadata.capture_provider = provider;
+      snapshot.metadata.capture_strategy = jobStrategy || 'unknown';
+      snapshot.checksum = await calculateChecksum(snapshot);
+      if (wantsSeal) snapshot.signature = await signChecksumDeviceOnly(snapshot.checksum);
+
+      await saveLastSnapshot(snapshot);
+      await emitCaptureProgress(
+        {
+          captureId: captureIdActive,
+          tabId: jobTabId,
+          provider,
+          strategy: jobStrategy,
+          phase: 'done',
+          status: 'done',
+          totalMessages: messages.length,
+          receivedMessages: messages.length,
+          completedAt: Date.now()
+        },
+        true
+      );
+      log('Snapshot job done', { provider, messages: messages.length, outputMode });
+    } catch (e) {
+      await emitCaptureProgress(
+        {
+          captureId: captureIdActive,
+          tabId: jobTabId,
+          provider: getProvider(),
+          strategy: jobStrategy,
+          phase: 'error',
+          status: 'error',
+          error: String(e && e.message ? e.message : e)
+        },
+        true
+      );
+      logError('Snapshot job failed', e);
+    } finally {
+      snapshotJobRunning = false;
+      stopProgressHeartbeat();
+    }
+  }
 
   /**
    * @param {string} msg
@@ -68,7 +563,37 @@
    * @param {any=} err
    */
   function logError(msg, err) {
+    const m = String(err && err.message ? err.message : err || '');
+    // Expected during dev reload/update: old content-script contexts can throw on any chrome.* call.
+    if (/Extension context invalidated/i.test(m)) return;
     console.error(LOG_PREFIX, msg, err);
+  }
+
+  let rl4ContextInvalidated = false;
+  function isExtensionContextAlive() {
+    try {
+      if (rl4ContextInvalidated) return false;
+      if (!chrome || !chrome.runtime || !chrome.runtime.id) return false;
+      if (!chrome.storage || !chrome.storage.local) return false;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function softShutdown(reason) {
+    try {
+      rl4ContextInvalidated = true;
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = null;
+      if (observer) observer.disconnect();
+      observer = null;
+      if (progressHeartbeatTimer) clearInterval(progressHeartbeatTimer);
+      progressHeartbeatTimer = null;
+      log('Soft shutdown', { reason });
+    } catch (_) {
+      // ignore
+    }
   }
 
   function getProvider() {
@@ -110,6 +635,7 @@
 
       const onRouteMaybeChanged = async (reason) => {
         try {
+          if (!isExtensionContextAlive()) return;
           const p = window.location.pathname || '';
           if (p === lastPathname) return;
           const prev = lastPathname;
@@ -118,6 +644,11 @@
           await ensureSessionId(); // will reset if conv changed
           await scanAndSyncMessages('route-change');
         } catch (e) {
+          const m = String(e && e.message ? e.message : e || '');
+          if (/Extension context invalidated/i.test(m)) {
+            softShutdown('context_invalidated_route');
+            return;
+          }
           logError('Route change handler failed', e);
         }
       };
@@ -178,11 +709,36 @@
     if (typeof content === 'object') {
       // ChatGPT: { parts: ["..."] } (most common)
       if (Array.isArray(content.parts)) {
-        return content.parts.filter((p) => typeof p === 'string').join('\n').trim();
+        return content.parts
+          .map((p) => {
+            if (typeof p === 'string') return p;
+            // Some ChatGPT payloads include structured parts: { type:'text', text:'...' } / { text:'...' }
+            if (p && typeof p === 'object') {
+              if (typeof p.text === 'string') return p.text;
+              if (p.type === 'text' && typeof p.text === 'string') return p.text;
+              if (typeof p.content === 'string') return p.content;
+            }
+            return '';
+          })
+          .filter(Boolean)
+          .join('\n')
+          .trim();
       }
       // Sometimes nested: { content: { parts: [...] } }
       if (content.content && typeof content.content === 'object' && Array.isArray(content.content.parts)) {
-        return content.content.parts.filter((p) => typeof p === 'string').join('\n').trim();
+        return content.content.parts
+          .map((p) => {
+            if (typeof p === 'string') return p;
+            if (p && typeof p === 'object') {
+              if (typeof p.text === 'string') return p.text;
+              if (p.type === 'text' && typeof p.text === 'string') return p.text;
+              if (typeof p.content === 'string') return p.content;
+            }
+            return '';
+          })
+          .filter(Boolean)
+          .join('\n')
+          .trim();
       }
       if (typeof content.text === 'string') return content.text;
       if (content.type === 'text' && typeof content.text === 'string') return content.text;
@@ -336,7 +892,7 @@
             (nestedMsg ? nestedMsg.content ?? nestedMsg : item.message)
         );
         if (role && content && content.length > 0) {
-          const sig = `${role}|${content.slice(0, 300).toLowerCase()}`;
+          const sig = signature(role, content);
           if (!seen.has(sig)) {
             seen.add(sig);
             out.push({
@@ -372,7 +928,7 @@
 
     const pushOne = (role, content, timestamp) => {
       if (!role || !content) return;
-      const sig = `${role}|${String(content).slice(0, 300).toLowerCase()}`;
+      const sig = signature(role, String(content));
       if (seen.has(sig)) return;
       seen.add(sig);
       out.push({ role, content: String(content), timestamp });
@@ -397,32 +953,62 @@
       }
     };
 
-    // ChatGPT full conversation format: { mapping: { nodeId: { message: { author:{role}, content:{parts} } } } }
+    // ChatGPT full conversation format: { mapping: { nodeId: { parent, message } }, current_node: "<nodeId>" }
+    // IMPORTANT: mapping is a graph. The "real conversation" is the path root -> current_node (not Object.values(mapping)).
     if (root && typeof root === 'object' && root.mapping && typeof root.mapping === 'object') {
       try {
-        const nodes = Object.values(root.mapping);
+        const mapping = root.mapping;
+        const currentNode =
+          (typeof root.current_node === 'string' && root.current_node) ||
+          (typeof root.currentNode === 'string' && root.currentNode) ||
+          '';
+
+        const chainIds = [];
+        if (currentNode && mapping[currentNode]) {
+          let cur = currentNode;
+          const guard = new Set();
+          while (cur && mapping[cur] && !guard.has(cur) && chainIds.length < 100_000) {
+            guard.add(cur);
+            chainIds.push(cur);
+            cur = mapping[cur] && typeof mapping[cur] === 'object' ? mapping[cur].parent : null;
+          }
+          chainIds.reverse();
+        }
+
         const extracted = [];
-        for (const n of nodes) {
-          if (!n || typeof n !== 'object') continue;
-          if (!n.message || typeof n.message !== 'object') continue;
-          const authorRole = n.message.author ? n.message.author.role : undefined;
+        const idsToUse = chainIds.length ? chainIds : Object.keys(mapping);
+        for (const id of idsToUse) {
+          const node = mapping[id];
+          const msg = node && typeof node === 'object' ? node.message : null;
+          if (!msg || typeof msg !== 'object') continue;
+
+          const authorRole = msg.author && typeof msg.author === 'object' ? msg.author.role : undefined;
           const role = normalizeRole(authorRole, authorRole);
-          const content = normalizeContent(n.message.content ?? n.message);
-          if (!role || !content) continue;
+          if (role !== 'user' && role !== 'assistant') continue;
+
+          // Skip non-conversation blobs and hidden items
+          const c = msg.content && typeof msg.content === 'object' ? msg.content : null;
+          const ctype = c && typeof c.content_type === 'string' ? c.content_type : '';
+          if (ctype === 'user_editable_context') continue;
+          const md = msg.metadata && typeof msg.metadata === 'object' ? msg.metadata : null;
+          if (md && md.is_visually_hidden_from_conversation) continue;
+
+          const content = normalizeContent(c ?? msg);
+          if (!content) continue;
+
           extracted.push({
             role,
             content,
             timestamp:
-              typeof n.message.create_time === 'number'
-                ? new Date(n.message.create_time * 1000).toISOString()
+              typeof msg.create_time === 'number'
+                ? new Date(msg.create_time * 1000).toISOString()
                 : undefined
           });
         }
-        // stable ordering
-        extracted.sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
+
         const asArray = extractFromArray(extracted, seen);
         if (asArray.length > 0) {
-          log('Found ChatGPT mapping structure', { count: asArray.length });
+          log('Found ChatGPT mapping structure', { count: asArray.length, usedPath: !!chainIds.length });
           out.push(...asArray);
         }
       } catch (_) {
@@ -473,7 +1059,7 @@
     const uniq = [];
     const sigSeen = new Set();
     for (const m of out) {
-      const sig = `${m.role}|${(m.content || '').slice(0, 300).toLowerCase()}`;
+      const sig = signature(m.role, m.content || '');
       if (sigSeen.has(sig)) continue;
       sigSeen.add(sig);
       uniq.push(m);
@@ -489,7 +1075,89 @@
    */
   async function onApiEvent(payload) {
     try {
-      if (!payload || !payload.body) return;
+      if (!payload) return;
+
+      // ChatGPT conversation chunks (from page-context interceptor): fidelity-first, no raw body needed.
+      if (payload.kind === 'chatgpt_conversation_chunk' && Array.isArray(payload.messages)) {
+        const url = String(payload.url || '');
+        const sessionId = await ensureSessionId();
+        if (!Array.isArray(apiMessagesCache)) apiMessagesCache = [];
+
+        // Progress init / update
+        if (!captureIdActive) captureIdActive = `cap-${Date.now()}`;
+        const totalChunks = typeof payload.totalChunks === 'number' ? payload.totalChunks : null;
+        const totalMessages = typeof payload.totalMessages === 'number' ? payload.totalMessages : null;
+        const chunkIndex = typeof payload.chunkIndex === 'number' ? payload.chunkIndex : null;
+        if (typeof chunkIndex === 'number' && !chatgptChunkSeen.has(chunkIndex)) chatgptChunkSeen.add(chunkIndex);
+
+        // Budget tracking
+        let totalChars = apiMessagesCache.reduce((acc, m) => acc + (m && m.content ? m.content.length : 0), 0);
+        const existingSig = new Set(apiMessagesCache.map((m) => signature(m.role, m.content)));
+
+        let budgetReached = false;
+        for (const raw of payload.messages) {
+          const role = normalizeRole(raw && raw.role, raw && raw.role);
+          let content = normalizeContent(raw && raw.content);
+          if (!role || !content) continue;
+          if (content.length > MAX_SINGLE_MESSAGE_CHARS) {
+            content = content.slice(0, MAX_SINGLE_MESSAGE_CHARS) + '\n[RL4_TRUNCATED_MESSAGE]';
+          }
+
+          const sig = signature(role, content);
+          if (existingSig.has(sig)) continue;
+          existingSig.add(sig);
+
+          totalChars += content.length;
+          if (totalChars > MAX_API_CACHE_TOTAL_CHARS || apiMessagesCache.length >= MAX_API_CACHE_MESSAGES) {
+            // Stop accumulating; keep what we have. Caller may switch to Ultra/Ultra+.
+            log('API cache budget reached; stopping accumulation', {
+              messages: apiMessagesCache.length,
+              totalChars,
+              maxChars: MAX_API_CACHE_TOTAL_CHARS,
+              maxMessages: MAX_API_CACHE_MESSAGES
+            });
+            budgetReached = true;
+            break;
+          }
+
+          apiMessagesCache.push({
+            id: `msg-${apiMessagesCache.length + 1}`,
+            role,
+            content,
+            timestamp:
+              typeof raw.timestamp === 'number'
+                ? new Date(raw.timestamp * 1000).toISOString()
+                : new Date().toISOString(),
+            session_id: sessionId,
+            captured_at: Date.now(),
+            source: 'chatgpt_conversation_api',
+            source_url: url
+          });
+        }
+
+        // Persist bounded subset for debugging only
+        const approxChars = apiMessagesCache.reduce((acc, m) => acc + (m.content ? m.content.length : 0), 0);
+        const bounded = approxChars > MAX_STORAGE_MESSAGE_CHARS ? apiMessagesCache.slice(-300) : apiMessagesCache;
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.API_MESSAGES]: bounded,
+          [STORAGE_KEYS.API_EVENTS]: apiEvents
+        });
+
+        await setCaptureProgress({
+          captureId: captureIdActive,
+          provider: 'chatgpt',
+          phase: 'api_capture',
+          status: budgetReached ? 'partial_budget_reached' : 'capturing',
+          totalChunks,
+          receivedChunks: chatgptChunkSeen.size,
+          totalMessages,
+          receivedMessages: apiMessagesCache.length,
+          approxChars
+        });
+        return;
+      }
+
+      if (!payload.body) return;
       const url = String(payload.url || '');
       // Keep events bounded
       apiEvents.push({ ...payload, url, receivedAt: Date.now() });
@@ -552,9 +1220,8 @@
       }
 
       // Cap in-memory cache to avoid runaway memory on long sessions.
-      if (apiMessagesCache.length > MAX_API_CACHE_MESSAGES) {
-        apiMessagesCache = apiMessagesCache.slice(-MAX_API_CACHE_MESSAGES);
-      }
+      // For generic API events we still cap hard (to avoid memory blowups); ChatGPT conversation uses its own budget.
+      if (apiMessagesCache.length > MAX_API_CACHE_MESSAGES) apiMessagesCache = apiMessagesCache.slice(-MAX_API_CACHE_MESSAGES);
 
       // Persist a bounded subset for popup retrieval / debugging (avoid quota errors).
       // Full-fidelity retrieval should use in-memory cache via sendMessage (see getMessages handler).
@@ -582,6 +1249,184 @@
       if (!id) return [];
       const provider = getProvider();
       if (provider !== 'chatgpt') return [];
+
+      const extractFromMapping = (json) => {
+        const out = [];
+        const mapping = json && typeof json === 'object' ? json.mapping : null;
+        if (!mapping || typeof mapping !== 'object') return out;
+
+        const currentNode =
+          (json && typeof json === 'object' && typeof json.current_node === 'string' && json.current_node) ||
+          (json && typeof json === 'object' && typeof json.currentNode === 'string' && json.currentNode) ||
+          '';
+
+        // Follow the real conversation path: root -> current_node
+        const chainIds = [];
+        if (currentNode && mapping[currentNode]) {
+          let cur = currentNode;
+          const guard = new Set();
+          while (cur && mapping[cur] && !guard.has(cur) && chainIds.length < 100_000) {
+            guard.add(cur);
+            chainIds.push(cur);
+            cur = mapping[cur] && typeof mapping[cur] === 'object' ? mapping[cur].parent : null;
+          }
+          chainIds.reverse();
+        }
+
+        const idsToUse = chainIds.length ? chainIds : Object.keys(mapping);
+        for (const id of idsToUse) {
+          const node = mapping[id];
+          const msg = node && typeof node === 'object' ? node.message : null;
+          if (!msg || typeof msg !== 'object') continue;
+
+          const role = msg.author && typeof msg.author === 'object' ? msg.author.role : null;
+          if (role !== 'user' && role !== 'assistant') continue;
+
+          const content = msg.content && typeof msg.content === 'object' ? msg.content : null;
+          const ctype = content && typeof content.content_type === 'string' ? content.content_type : '';
+          if (ctype === 'user_editable_context') continue;
+
+          const md = msg.metadata && typeof msg.metadata === 'object' ? msg.metadata : null;
+          if (md && md.is_visually_hidden_from_conversation) continue;
+
+          let text = normalizeContent(content ?? msg);
+          if (!text) continue;
+
+          out.push({
+            role,
+            content: text,
+            timestamp: typeof msg.create_time === 'number' ? msg.create_time : null
+          });
+        }
+        return out;
+      };
+
+      const convUrl = `${location.origin}/backend-api/conversation/${encodeURIComponent(id)}`;
+
+      // 0) Surgical Fetch (cookie-first): often works without any token header, and is the safest/most universal.
+      try {
+        log('ChatGPT surgical fetch (cookie): trying', { url: convUrl });
+        const res = await fetch(convUrl, { credentials: 'include', headers: { Accept: 'application/json' } });
+        if (res && res.ok) {
+          const json = await res.json();
+          const mapped = extractFromMapping(json);
+          if (mapped && mapped.length) {
+            const sessionId = await ensureSessionId();
+            const out = mapped.map((m, idx) => ({
+              id: `msg-${idx + 1}`,
+              role: normalizeRole(m.role, m.role),
+              content: normalizeContent(m.content),
+              timestamp:
+                typeof m.timestamp === 'number'
+                  ? new Date(m.timestamp * 1000).toISOString()
+                  : new Date().toISOString(),
+              session_id: sessionId,
+              captured_at: Date.now(),
+              source: 'chatgpt_surgical_fetch_cookie',
+              source_url: convUrl
+            }));
+            apiMessagesCache = out;
+            await emitCaptureProgress(
+              {
+                captureId: captureIdActive,
+                tabId: jobTabId,
+                provider,
+                strategy: 'chatgpt_surgical',
+                phase: 'fetch',
+                phaseIndex: 1,
+                phaseTotal: 2,
+                status: 'capturing',
+                receivedMessages: out.length,
+                totalMessages: out.length
+              },
+              true
+            );
+            log('ChatGPT surgical fetch (cookie): success', { messages: out.length });
+            return out;
+          }
+          log('ChatGPT surgical fetch (cookie): mapping parsed 0 messages', {
+            hasMapping: !!(json && typeof json === 'object' && json.mapping)
+          });
+        } else {
+          log('ChatGPT surgical fetch (cookie): not ok', { status: res ? res.status : 'unknown' });
+        }
+      } catch (e) {
+        log('ChatGPT surgical fetch (cookie): failed (fallback)', { error: e?.message || String(e) });
+      }
+
+      // 1) Surgical Fetch (token): some deployments require Bearer token.
+      try {
+        const sessRes = await fetch(`${location.origin}/api/auth/session`, { credentials: 'include' });
+        if (sessRes && sessRes.ok) {
+          const sess = await sessRes.json();
+          const token =
+            (sess && typeof sess === 'object' && typeof sess.accessToken === 'string' && sess.accessToken) ||
+            (sess && typeof sess === 'object' && typeof sess.access_token === 'string' && sess.access_token) ||
+            (sess && typeof sess === 'object' && typeof sess.token === 'string' && sess.token) ||
+            '';
+          if (token) {
+            log('ChatGPT surgical fetch (token): trying', { url: convUrl });
+            const res = await fetch(convUrl, {
+              credentials: 'include',
+              headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${token}`
+              }
+            });
+            if (res && res.ok) {
+              const json = await res.json();
+              const mapped = extractFromMapping(json);
+              if (mapped && mapped.length) {
+                const sessionId = await ensureSessionId();
+                const out = mapped.map((m, idx) => ({
+                  id: `msg-${idx + 1}`,
+                  role: normalizeRole(m.role, m.role),
+                  content: normalizeContent(m.content),
+                  timestamp:
+                    typeof m.timestamp === 'number'
+                      ? new Date(m.timestamp * 1000).toISOString()
+                      : new Date().toISOString(),
+                  session_id: sessionId,
+                  captured_at: Date.now(),
+                  source: 'chatgpt_surgical_fetch_token',
+                  source_url: convUrl
+                }));
+                apiMessagesCache = out;
+                await emitCaptureProgress(
+                  {
+                    captureId: captureIdActive,
+                    tabId: jobTabId,
+                    provider,
+                    strategy: 'chatgpt_surgical',
+                    phase: 'fetch',
+                    phaseIndex: 1,
+                    phaseTotal: 2,
+                    status: 'capturing',
+                    receivedMessages: out.length,
+                    totalMessages: out.length
+                  },
+                  true
+                );
+                log('ChatGPT surgical fetch (token): success', { messages: out.length });
+                return out;
+              }
+              log('ChatGPT surgical fetch (token): mapping parsed 0 messages', {
+                hasMapping: !!(json && typeof json === 'object' && json.mapping)
+              });
+            } else {
+              log('ChatGPT surgical fetch (token): not ok', { status: res ? res.status : 'unknown' });
+            }
+          } else {
+            log('ChatGPT surgical fetch (token): no token in session payload', {
+              keys: sess && typeof sess === 'object' ? Object.keys(sess).slice(0, 20) : []
+            });
+          }
+        } else {
+          log('ChatGPT surgical fetch (token): session endpoint not ok', { status: sessRes ? sessRes.status : 'unknown' });
+        }
+      } catch (e) {
+        log('ChatGPT surgical fetch (token): failed (fallback)', { error: e?.message || String(e) });
+      }
 
       const endpoints = [
         `/backend-api/conversation/${encodeURIComponent(id)}`,
@@ -624,7 +1469,18 @@
           const json = await res.json();
           const extracted = extractMessagesFromAnyJson(json);
           if (!extracted.length) {
-            log('ChatGPT deep fetch: no messages extracted', { url });
+            // Minimal forensic breadcrumbs (no content): helps adapt parsers when ChatGPT payload shape changes.
+            try {
+              const topKeys = json && typeof json === 'object' ? Object.keys(json).slice(0, 30) : [];
+              log('ChatGPT deep fetch: no messages extracted', {
+                url,
+                topKeys,
+                hasMapping: !!(json && typeof json === 'object' && json.mapping),
+                hasMessagesArray: !!(json && typeof json === 'object' && Array.isArray(json.messages))
+              });
+            } catch (_) {
+              log('ChatGPT deep fetch: no messages extracted', { url });
+            }
             continue;
           }
 
@@ -664,6 +1520,113 @@
       }
       return [];
     } catch (_) {
+      return [];
+    }
+  }
+
+  async function requestChatGPTConversationViaPageContext(convId) {
+    try {
+      const id = String(convId || '').trim();
+      if (!id) return false;
+      if (getProvider() !== 'chatgpt') return false;
+      window.postMessage(
+        {
+          type: 'RL4_API_REQUEST',
+          payload: { action: 'fetch_chatgpt_conversation', conversationId: id }
+        },
+        '*'
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * ChatGPT is a Next.js app; conversation state is often present in embedded JSON (e.g. __NEXT_DATA__).
+   * This is usually faster + more complete than DOM scrolling for huge chats.
+   * @returns {Promise<Array<any>>} messages in extension format (or [])
+   */
+  async function tryExtractChatGPTEmbeddedState() {
+    try {
+      if (getProvider() !== 'chatgpt') return [];
+
+      const candidates = [];
+
+      // A) window.__NEXT_DATA__ (when available)
+      try {
+        if (window.__NEXT_DATA__ && typeof window.__NEXT_DATA__ === 'object') {
+          candidates.push({ source: 'window.__NEXT_DATA__', value: window.__NEXT_DATA__ });
+        }
+      } catch (_) {}
+
+      // B) <script id="__NEXT_DATA__" type="application/json">...</script>
+      try {
+        const el = document.querySelector('script#__NEXT_DATA__');
+        const txt = el && el.textContent ? el.textContent.trim() : '';
+        if (txt && txt.length > 1000) {
+          candidates.push({ source: 'script#__NEXT_DATA__', value: JSON.parse(txt) });
+        }
+      } catch (_) {}
+
+      // C) Other large JSON scripts (best-effort)
+      try {
+        const scripts = Array.from(document.querySelectorAll('script[type="application/json"]'));
+        for (const s of scripts) {
+          const txt = s && s.textContent ? s.textContent.trim() : '';
+          if (!txt || txt.length < 5000) continue;
+          // quick heuristic to avoid parsing unrelated configs
+          if (!/conversation|mapping|message|messages|author|content/i.test(txt)) continue;
+          try {
+            candidates.push({ source: 'script[type=application/json]', value: JSON.parse(txt) });
+          } catch (_) {
+            // ignore parse failures
+          }
+          // cap parsing work
+          if (candidates.length >= 6) break;
+        }
+      } catch (_) {}
+
+      if (!candidates.length) return [];
+
+      // Extract messages from each candidate, pick the largest.
+      let best = [];
+      let bestSource = '';
+      for (const c of candidates) {
+        try {
+          const extracted = extractMessagesFromAnyJson(c.value);
+          if (extracted && extracted.length > best.length) {
+            best = extracted;
+            bestSource = c.source;
+          }
+        } catch (_) {}
+      }
+
+      if (!best.length) return [];
+
+      const sessionId = await ensureSessionId();
+      const nowIso = new Date().toISOString();
+      const out = best.map((m, idx) => ({
+        id: `msg-${idx + 1}`,
+        role: m.role,
+        content: m.content,
+        timestamp: typeof m.timestamp === 'string' ? m.timestamp : nowIso,
+        session_id: sessionId,
+        captured_at: Date.now(),
+        source: 'embedded_state',
+        source_url: bestSource
+      }));
+
+      // Cache in memory for perfect retrieval (avoid storage quota).
+      apiMessagesCache = out;
+      if (apiMessagesCache.length > MAX_API_CACHE_MESSAGES) {
+        apiMessagesCache = apiMessagesCache.slice(-MAX_API_CACHE_MESSAGES);
+      }
+
+      log('ChatGPT embedded state extraction: success', { source: bestSource, messages: out.length });
+      return out;
+    } catch (e) {
+      logError('ChatGPT embedded state extraction failed', e);
       return [];
     }
   }
@@ -1094,6 +2057,231 @@
     return fallback.map((el) => ({ el, role: detectRole(el) }));
   }
 
+  // --- RL4 Blocks Encoder capture ---
+  function extractRl4BlocksFromText(text) {
+    let t = String(text || '');
+    if (!t) return null;
+
+    // If the encoder included an explicit end marker, ignore everything after it.
+    if (t.includes('<RL4-END/>')) {
+      t = t.split('<RL4-END/>')[0];
+    }
+
+    const get = (tag) => {
+      const re = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i');
+      const m = t.match(re);
+      return m && m[0] ? m[0].trim() : '';
+    };
+
+    const arch = get('RL4-ARCH');
+    const layers = get('RL4-LAYERS');
+    const topics = get('RL4-TOPICS');
+    const timeline = get('RL4-TIMELINE');
+    const decisions = get('RL4-DECISIONS');
+    const insights = get('RL4-INSIGHTS');
+
+    // Best-effort HUMAN SUMMARY: capture text after "HUMAN SUMMARY" heading when present.
+    let human_summary = '';
+    const hm1 = t.match(/##\s*📋\s*HUMAN\s+SUMMARY[\s\S]*?\n([\s\S]{10,4000})$/i);
+    const hm2 = t.match(/HUMAN\s+SUMMARY[\s\S]*?\n([\s\S]{10,4000})$/i);
+    const rawHm = (hm1 && hm1[1]) ? hm1[1] : (hm2 && hm2[1]) ? hm2[1] : '';
+    if (rawHm) {
+      // Stop at common separators or a new unrelated section (to avoid “extra recommendations”).
+      const cut = String(rawHm)
+        .split(/\n-{3,}\n/)[0]
+        .split(/\n_{3,}\n/)[0]
+        .split(/\n###\s+/)[0]
+        .trim();
+      // Keep bounded: first 12 lines max.
+      const lines = cut.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      human_summary = lines.slice(0, 12).join('\n');
+    }
+
+    const found = [arch, layers, topics, timeline, decisions, insights].filter(Boolean).length;
+    if (found < 4) return null; // avoid false positives
+
+    // Guardrail: reject obviously truncated captures like "<RL4-ARCH> ... </RL4-ARCH>"
+    // Some UIs collapse long blocks and inject ellipses; prefer manual paste in that case.
+    const innerLen = (tagText, tagName) => {
+      const open = new RegExp(`^<${tagName}>`, 'i');
+      const close = new RegExp(`<\\/${tagName}>$`, 'i');
+      const inner = String(tagText || '').replace(open, '').replace(close, '').trim();
+      return inner.length;
+    };
+    const suspiciousEllipsis = (tagText, tagName) => {
+      const open = new RegExp(`^<${tagName}>`, 'i');
+      const close = new RegExp(`<\\/${tagName}>$`, 'i');
+      const inner = String(tagText || '').replace(open, '').replace(close, '').trim();
+      return inner === '...' || inner === '…' || (inner.includes('...') && inner.length < 60);
+    };
+
+    const anySuspicious =
+      (arch && suspiciousEllipsis(arch, 'RL4-ARCH')) ||
+      (layers && suspiciousEllipsis(layers, 'RL4-LAYERS')) ||
+      (topics && suspiciousEllipsis(topics, 'RL4-TOPICS')) ||
+      (timeline && suspiciousEllipsis(timeline, 'RL4-TIMELINE')) ||
+      (decisions && suspiciousEllipsis(decisions, 'RL4-DECISIONS')) ||
+      (insights && suspiciousEllipsis(insights, 'RL4-INSIGHTS'));
+
+    // Require at least one “substantial” block body (keep tolerant: some encoders output very compact blocks).
+    const hasSubstantial =
+      innerLen(arch, 'RL4-ARCH') > 20 ||
+      innerLen(timeline, 'RL4-TIMELINE') > 40 ||
+      innerLen(decisions, 'RL4-DECISIONS') > 40 ||
+      innerLen(insights, 'RL4-INSIGHTS') > 40;
+
+    if (anySuspicious || !hasSubstantial) return null;
+
+    return {
+      arch,
+      layers,
+      topics,
+      timeline,
+      decisions,
+      insights,
+      human_summary,
+      found_blocks: found
+    };
+  }
+
+  async function sealRl4BlocksIntoSnapshot(blocksPayload) {
+    try {
+      const res = await chrome.storage.local.get([STORAGE_KEYS.LAST_SNAPSHOT]);
+      const last = res && res[STORAGE_KEYS.LAST_SNAPSHOT] && typeof res[STORAGE_KEYS.LAST_SNAPSHOT] === 'object'
+        ? res[STORAGE_KEYS.LAST_SNAPSHOT]
+        : null;
+      if (!last) {
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.RL4_BLOCKS_STATUS]: { status: 'error', error: 'No snapshot found to seal into.', updatedAt: Date.now() }
+        });
+        return;
+      }
+
+      const next = {
+        ...last,
+        rl4_blocks: blocksPayload
+      };
+
+      // Recompute checksum and re-sign if snapshot was previously sealed.
+      next.checksum = await calculateChecksum(next);
+      if (next.signature && typeof next.signature === 'object') {
+        next.signature = await signChecksumDeviceOnly(next.checksum);
+      }
+
+      await saveLastSnapshot(next);
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.RL4_BLOCKS_STATUS]: {
+          status: 'sealed',
+          found_blocks: typeof blocksPayload?.blocks?.found_blocks === 'number' ? blocksPayload.blocks.found_blocks : undefined,
+          updatedAt: Date.now()
+        }
+      });
+    } catch (e) {
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.RL4_BLOCKS_STATUS]: { status: 'error', error: String(e?.message || e), updatedAt: Date.now() }
+      });
+    }
+  }
+
+  async function scanForRl4Blocks(reason = 'scan') {
+    if (!rl4BlocksArmed) return;
+    if (rl4BlocksCaptured) return;
+
+    try {
+      const candidates = [];
+
+      // 1) Prefer API event bodies (often contains full assistant text even if DOM is collapsed)
+      try {
+        const apiText = (Array.isArray(apiEvents) ? apiEvents : [])
+          .slice(-30)
+          .map((e) => (e && typeof e.body === 'string' ? e.body : ''))
+          .filter((s) => s && s.includes('<RL4-'))
+          .join('\n\n');
+        if (apiText) candidates.push(apiText);
+      } catch (_) {}
+
+      // 2) Try API messages cache (assistant outputs)
+      try {
+        const cacheText = (Array.isArray(apiMessagesCache) ? apiMessagesCache : [])
+          .slice(-60)
+          .filter((m) => String(m?.role || '') === 'assistant')
+          .map((m) => String(m?.content || ''))
+          .filter((s) => s && s.includes('<RL4-'))
+          .join('\n\n');
+        if (cacheText) candidates.push(cacheText);
+      } catch (_) {}
+
+      // 3) Fallback: DOM last visible nodes (can be collapsed → may contain "...")
+      const nodes = getMessageNodes();
+      if (nodes && nodes.length) {
+        const tail = nodes.slice(-30);
+        let combined = '';
+        for (const n of tail) {
+          const el = n && n.el ? n.el : null;
+          const txt = el ? (el.innerText || el.textContent || '') : '';
+          if (!txt) continue;
+          if (!txt.includes('<RL4-')) continue;
+          combined += `\n\n${txt}`;
+        }
+        if (combined) candidates.push(combined);
+      }
+
+      // Pick the best candidate (most blocks)
+      let best = null;
+      for (const c of candidates) {
+        const b = extractRl4BlocksFromText(c);
+        if (!b) continue;
+        if (!best || (b.found_blocks || 0) > (best.found_blocks || 0)) best = b;
+      }
+
+      if (!best) {
+        // Keep awaiting; user can paste manually.
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.RL4_BLOCKS_STATUS]: {
+            status: 'awaiting',
+            provider: getProvider(),
+            convId: getConversationIdFromUrl(),
+            updatedAt: Date.now(),
+            hint: 'Auto-capture did not find complete RL4 blocks. Paste reply manually to finalize.'
+          }
+        });
+        return;
+      }
+
+      rl4BlocksCaptured = true;
+      const payload = {
+        capturedAt: Date.now(),
+        provider: getProvider(),
+        convId: getConversationIdFromUrl(),
+        reason,
+        blocks: best
+      };
+
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.RL4_BLOCKS]: payload,
+        [STORAGE_KEYS.RL4_BLOCKS_STATUS]: {
+          status: 'captured',
+          found_blocks: best.found_blocks,
+          updatedAt: Date.now()
+        }
+      });
+
+      // Auto-seal into the latest snapshot so the exported JSON contains the “intelligence”.
+      await sealRl4BlocksIntoSnapshot(payload);
+    } catch (e) {
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.RL4_BLOCKS_STATUS]: { status: 'error', error: String(e?.message || e), updatedAt: Date.now() }
+      });
+    }
+  }
+
+  function maybeScanRl4Blocks(reason = 'mutation') {
+    const now = Date.now();
+    if (now - lastRl4BlocksScanAt < 750) return;
+    lastRl4BlocksScanAt = now;
+    scanForRl4Blocks(reason).catch(() => {});
+  }
+
   /**
    * Extract plain text content from a message element.
    * @param {Element} el
@@ -1219,14 +2407,19 @@
   }
 
   /**
-   * Cheap stable signature for de-dup (no crypto). Lowercase + first chars.
+   * Cheap stable signature for de-dup (no crypto).
+   * IMPORTANT: do NOT use only the prefix, as many LLM messages share long identical starts.
+   * We use: normalized prefix + normalized suffix + length.
    * @param {string} role
    * @param {string} content
    * @returns {string}
    */
   function signature(role, content) {
     const c = (content || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    return `${role || 'unknown'}|${c.slice(0, 300)}`;
+    const len = c.length;
+    const head = c.slice(0, 220);
+    const tail = len > 220 ? c.slice(Math.max(0, len - 220)) : '';
+    return `${role || 'unknown'}|${len}|${head}|${tail}`;
   }
 
   /**
@@ -1266,6 +2459,8 @@
    * @param {string} reason
    */
   async function scanAndSyncMessages(reason, options = {}) {
+    if (!isExtensionContextAlive()) return;
+    try {
     const sessionId = await ensureSessionId();
     const nodes = getMessageNodes();
     const parsed = [];
@@ -1279,6 +2474,13 @@
 
     if (!parsed.length) {
       log('No messages detected during scan', { reason });
+      emitCaptureProgress({
+        captureId: captureIdActive,
+        provider: getProvider(),
+        phase: 'scan',
+        status: 'no_messages',
+        receivedMessages: 0
+      }).catch(() => {});
       return;
     }
 
@@ -1339,6 +2541,13 @@
       }
       await saveToStorage(next);
       log('Messages synced', { reason, sessionId, total: next.length, unknownRolesInParse: unknownCount });
+      emitCaptureProgress({
+        captureId: captureIdActive,
+        provider: getProvider(),
+        phase: 'scan',
+        status: 'capturing',
+        receivedMessages: next.length
+      }).catch(() => {});
       return;
     }
 
@@ -1365,6 +2574,21 @@
 
     await saveToStorage(next);
     log('Messages appended', { reason, sessionId, added, total: next.length, unknownRolesInParse: unknownCount });
+      emitCaptureProgress({
+        captureId: captureIdActive,
+        provider: getProvider(),
+        phase: 'scan_append',
+        status: 'capturing',
+        receivedMessages: next.length
+      }).catch(() => {});
+    } catch (e) {
+      const m = String(e && e.message ? e.message : e || '');
+      if (/Extension context invalidated/i.test(m)) {
+        softShutdown('context_invalidated_scan');
+        return;
+      }
+      throw e;
+    }
   }
 
   /**
@@ -1393,6 +2617,12 @@
     if (scroller) scroller.scrollTo(0, 0);
     else window.scrollTo(0, 0);
     await sleep(350);
+    emitCaptureProgress({
+      captureId: captureIdActive,
+      provider,
+      phase: 'deep_scan',
+      status: 'capturing'
+    }).catch(() => {});
     await scanAndSyncMessages('deep-top', { append: true });
 
     while (Date.now() - start < maxMs) {
@@ -1411,6 +2641,13 @@
       const after = await chrome.storage.local.get([STORAGE_KEYS.CURRENT_MESSAGES]);
       const nextLen = Array.isArray(after[STORAGE_KEYS.CURRENT_MESSAGES]) ? after[STORAGE_KEYS.CURRENT_MESSAGES].length : 0;
       const added = nextLen - prevLen;
+      emitCaptureProgress({
+        captureId: captureIdActive,
+        provider,
+        phase: 'deep_scan',
+        status: 'capturing',
+        receivedMessages: nextLen
+      }).catch(() => {});
 
       if (added === 0 && lastAdded === 0) stableIters++;
       else stableIters = 0;
@@ -1577,8 +2814,8 @@
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const provider = getProvider();
     const waitMs = provider === 'chatgpt' ? Math.max(DEEP_HYDRATE_WAIT_MS, 2500) : DEEP_HYDRATE_WAIT_MS;
-    const maxNoGrowth = provider === 'chatgpt' ? 10 : 4;
-    const maxMs = provider === 'chatgpt' ? Math.max(DEEP_HYDRATE_MAX_MS, 180000) : DEEP_HYDRATE_MAX_MS;
+    const maxNoGrowth = provider === 'chatgpt' ? 25 : 4;
+    const maxMs = provider === 'chatgpt' ? Math.max(DEEP_HYDRATE_MAX_MS, 420000) : DEEP_HYDRATE_MAX_MS; // up to 7 min
     let noGrowth = 0;
 
     const getScrollHeight = () =>
@@ -1593,7 +2830,7 @@
       }
     };
 
-    const scrollUpPulse = () => {
+    const scrollUpPulse = async () => {
       // More human-like: step upward a bit many times (triggers "reverse infinite scroll" reliably)
       const target = scroller || window;
       const getY = () => (scroller ? scroller.scrollTop : window.scrollY);
@@ -1604,15 +2841,25 @@
       const viewportH = scroller ? scroller.clientHeight : window.innerHeight;
       const step = Math.max(220, Math.floor(viewportH * 0.6));
 
-      for (let k = 0; k < 8; k++) {
+      // ChatGPT: slower pulses seem to trigger chunk loading more reliably than instant "teleport to 0".
+      const pulses = provider === 'chatgpt' ? 14 : 8;
+      for (let k = 0; k < pulses; k++) {
         const y = getY();
         const nextY = Math.max(0, y - step);
         setY(nextY);
+        // Dispatch on both container and document to maximize handler coverage.
         dispatchWheel(target, -step);
+        try {
+          if (provider === 'chatgpt') dispatchWheel(document, -step);
+        } catch (_) {}
+        if (provider === 'chatgpt') await sleep(90);
       }
       // Ensure we actually touch the top boundary
       setY(0);
       dispatchWheel(target, -400);
+      try {
+        if (provider === 'chatgpt') dispatchWheel(document, -400);
+      } catch (_) {}
     };
     const scrollToBottom = () => {
       if (scroller) scroller.scrollTo(0, scroller.scrollHeight || 0);
@@ -1624,6 +2871,14 @@
         const res = await chrome.storage.local.get([STORAGE_KEYS.CURRENT_MESSAGES]);
         const msgs = Array.isArray(res[STORAGE_KEYS.CURRENT_MESSAGES]) ? res[STORAGE_KEYS.CURRENT_MESSAGES] : [];
         return msgs.length;
+      } catch (_) {
+        return 0;
+      }
+    };
+
+    const getApiCount = () => {
+      try {
+        return Array.isArray(apiMessagesCache) ? apiMessagesCache.length : 0;
       } catch (_) {
         return 0;
       }
@@ -1647,6 +2902,7 @@
     let prevH = getScrollHeight();
     let prevDomMsgCount = countMsgsIn(scroller || document);
     let prevMsgCount = await getStoredCount();
+    let prevApiCount = getApiCount();
     log('Hydration start', {
       reason,
       provider: getProvider(),
@@ -1655,12 +2911,24 @@
       scrollerClass: scroller ? scroller.className : '',
       prevH,
       prevDomMsgCount,
-      prevMsgCount
+      prevMsgCount,
+      prevApiCount
     });
+    emitCaptureProgress({
+      captureId: captureIdActive,
+      provider,
+      phase: 'hydrate',
+      status: 'capturing',
+      receivedMessages: Math.max(prevMsgCount, prevApiCount)
+    }).catch(() => {});
 
     while (Date.now() - start < maxMs && noGrowth < maxNoGrowth) {
-      scrollUpPulse();
-      // Wait for DOM mutation (better than fixed sleep). Fallback to timeout.
+      await scrollUpPulse();
+
+      const apiEventsBefore = apiEvents.length;
+      const apiCountBefore = getApiCount();
+
+      // Wait for DOM mutation or API event (better than fixed sleep). Fallback to timeout.
       await new Promise((resolve) => {
         const timeout = setTimeout(() => {
           try {
@@ -1669,7 +2937,8 @@
           resolve();
         }, waitMs);
 
-        const target = scroller || document.documentElement;
+        // ChatGPT often mutates outside the scroll container (react portals). Observe documentElement.
+        const target = provider === 'chatgpt' ? document.documentElement : (scroller || document.documentElement);
         let obs;
         try {
           obs = new MutationObserver(() => {
@@ -1679,12 +2948,20 @@
             } catch (_) {}
             resolve();
           });
-          obs.observe(target, { childList: true, subtree: true });
+          obs.observe(target, { childList: true, subtree: true, characterData: true, attributes: true });
         } catch (_) {
           clearTimeout(timeout);
           resolve();
         }
       });
+
+      // If API events are flowing, give it a tiny bit of extra time (ChatGPT can be delayed).
+      if (provider === 'chatgpt') {
+        const apiEventsAfter = apiEvents.length;
+        const apiCountAfter = getApiCount();
+        const apiMoved = apiEventsAfter > apiEventsBefore || apiCountAfter > apiCountBefore;
+        if (apiMoved) await sleep(650);
+      }
 
       await scanAndSyncMessages(`${reason}-top`, { append: true });
 
@@ -1692,7 +2969,12 @@
       const nextDomMsgCount = countMsgsIn(scroller || document);
       const nextMsgCountPromise = getStoredCount();
       const nextMsgCount = await nextMsgCountPromise;
-      const grew = nextMsgCount > prevMsgCount || nextH > prevH + 50 || nextDomMsgCount > prevDomMsgCount;
+      const nextApiCount = getApiCount();
+      const grew =
+        nextMsgCount > prevMsgCount ||
+        nextApiCount > prevApiCount ||
+        nextH > prevH + 50 ||
+        nextDomMsgCount > prevDomMsgCount;
       log('Hydration tick', {
         reason,
         scrollTop: getScrollTop(),
@@ -1702,9 +2984,18 @@
         nextDomMsgCount,
         prevMsgCount,
         nextMsgCount,
+        prevApiCount,
+        nextApiCount,
         grew,
         noGrowth
       });
+      emitCaptureProgress({
+        captureId: captureIdActive,
+        provider,
+        phase: 'hydrate',
+        status: grew ? 'capturing' : 'waiting',
+        receivedMessages: Math.max(nextMsgCount, nextApiCount)
+      }).catch(() => {});
       if (grew) {
         log('Hydration chunk loaded', {
           prevH,
@@ -1712,11 +3003,14 @@
           prevDomMsgCount,
           nextDomMsgCount,
           prevMsgCount,
-          nextMsgCount
+          nextMsgCount,
+          prevApiCount,
+          nextApiCount
         });
         prevH = nextH;
         prevDomMsgCount = nextDomMsgCount;
         prevMsgCount = nextMsgCount;
+        prevApiCount = nextApiCount;
         noGrowth = 0;
       } else {
         noGrowth++;
@@ -1724,6 +3018,20 @@
 
       // If we're at top and not growing, we're probably fully hydrated.
       if (getScrollTop() <= 2 && noGrowth >= maxNoGrowth) break;
+
+      // ChatGPT: jitter at the top to re-trigger "load older" sentinel logic.
+      if (provider === 'chatgpt' && getScrollTop() <= 2 && noGrowth > 0 && noGrowth % 3 === 0) {
+        try {
+          if (scroller) scroller.scrollTo(0, Math.min(180, scroller.scrollHeight || 0));
+          else window.scrollTo(0, 180);
+        } catch (_) {}
+        await sleep(180);
+        try {
+          if (scroller) scroller.scrollTo(0, 0);
+          else window.scrollTo(0, 0);
+        } catch (_) {}
+        await sleep(220);
+      }
     }
 
     // Restore to bottom to ensure latest messages are rendered (some UIs virtualize the bottom too).
@@ -1827,6 +3135,11 @@
         debounceTimer = setTimeout(() => {
           scanAndSyncMessages('mutation').catch((e) => logError('scanAndSyncMessages failed', e));
         }, OBSERVER_DEBOUNCE_MS);
+
+        // RL4 Blocks capture: if armed, scan for <RL4-...> tags in recent assistant output.
+        if (rl4BlocksArmed && !rl4BlocksCaptured) {
+          maybeScanRl4Blocks('mutation');
+        }
       });
 
       // document.body can be null very early; fallback to document.documentElement.
@@ -1857,10 +3170,124 @@
         });
         return false;
       }
+      if (request.action === 'armRl4BlocksCapture') {
+        rl4BlocksArmed = true;
+        rl4BlocksCaptured = false;
+        lastRl4BlocksScanAt = 0;
+
+        // Reset stored blocks and status for a fresh encode flow.
+        chrome.storage.local
+          .remove([STORAGE_KEYS.RL4_BLOCKS])
+          .catch(() => {});
+        chrome.storage.local
+          .set({
+            [STORAGE_KEYS.RL4_BLOCKS_STATUS]: {
+              status: 'awaiting',
+              provider: getProvider(),
+              convId: getConversationIdFromUrl(),
+              tabId: typeof request.tabId === 'number' ? request.tabId : null,
+              startedAt: Date.now(),
+              updatedAt: Date.now()
+            }
+          })
+          .catch(() => {});
+
+        // Best-effort immediate scan (in case blocks are already visible).
+        scanForRl4Blocks('arm').catch(() => {});
+
+        sendResponse({ ok: true, armed: true });
+        return false;
+      }
+      if (request.action === 'finalizeRl4BlocksManual') {
+        try {
+          const raw = typeof request.text === 'string' ? request.text : '';
+          const blocks = extractRl4BlocksFromText(raw);
+          if (!blocks) {
+            sendResponse({ ok: false, error: 'Could not find complete <RL4-...> blocks in pasted text.' });
+            return false;
+          }
+          rl4BlocksArmed = true;
+          rl4BlocksCaptured = true;
+
+          const payload = {
+            capturedAt: Date.now(),
+            provider: getProvider(),
+            convId: getConversationIdFromUrl(),
+            reason: 'manual',
+            blocks
+          };
+
+          chrome.storage.local
+            .set({
+              [STORAGE_KEYS.RL4_BLOCKS]: payload,
+              [STORAGE_KEYS.RL4_BLOCKS_STATUS]: {
+                status: 'captured',
+                found_blocks: blocks.found_blocks,
+                updatedAt: Date.now()
+              }
+            })
+            .then(() => sealRl4BlocksIntoSnapshot(payload))
+            .catch(() => {});
+
+          sendResponse({ ok: true, finalized: true });
+          return false;
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e?.message || e) });
+          return false;
+        }
+      }
+      if (request.action === 'startSnapshotJob') {
+        const provider = getProvider();
+        const cap = typeof request.captureId === 'string' && request.captureId.trim()
+          ? request.captureId.trim()
+          : `cap-${Date.now()}`;
+
+        if (snapshotJobRunning) {
+          sendResponse({
+            ok: false,
+            error: {
+              type: 'error',
+              code: 'JOB_ALREADY_RUNNING',
+              message: 'A snapshot job is already running on this tab.'
+            }
+          });
+          return false;
+        }
+
+        captureIdActive = cap;
+        chatgptChunkSeen = new Set();
+        jobTabId = sender && sender.tab && typeof sender.tab.id === 'number' ? sender.tab.id : null;
+        jobStrategy = null;
+        clearCaptureProgress().catch(() => {});
+        emitCaptureProgress({ captureId: captureIdActive, tabId: jobTabId, provider, phase: 'starting', status: 'starting' }, true).catch(() => {});
+
+        // Fire-and-forget: job continues even if popup closes.
+        runSnapshotJob(request.options || {}).catch((e) => logError('runSnapshotJob failed', e));
+
+        sendResponse({ ok: true, started: true, captureId: captureIdActive, provider });
+        return false;
+      }
+      if (request.action === 'openRl4InpagePanel') {
+        openInpagePanel();
+        sendResponse({ ok: true, opened: true });
+        return false;
+      }
       if (request.action === 'getMessages') {
         const isShare = window.location.pathname.startsWith('/share/');
         const wantsDeep = !!request.deep;
         const provider = getProvider();
+        captureIdActive = typeof request.captureId === 'string' && request.captureId.trim() ? request.captureId.trim() : `cap-${Date.now()}`;
+        chatgptChunkSeen = new Set();
+
+        // Reset progress for this run
+        clearCaptureProgress().catch(() => {});
+        setCaptureProgress({
+          captureId: captureIdActive,
+          provider,
+          phase: wantsDeep ? 'starting_deep' : 'starting',
+          status: 'starting',
+          startedAt: Date.now()
+        }).catch(() => {});
 
         // Share pages: fetch the same API endpoint the page uses (most reliable).
         // IMPORTANT: do NOT rely on chrome.storage for full share history (quota). Return messages directly.
@@ -2136,10 +3563,34 @@
               try {
                 // ChatGPT: first try direct backend conversation fetch (often returns full history instantly).
                 if (provider === 'chatgpt') {
+                  // Fastest: embedded state (Next.js) when present.
+                  const embedded = await tryExtractChatGPTEmbeddedState();
+                  if (embedded && embedded.length) return;
+
                   const convId = getConversationIdFromUrl();
-                  log('ChatGPT deep capture: starting backend fetch attempt', { convId });
+                  // Prefer page-context fetch via interceptor (more reliable than content-script fetch; avoids CORS/404 traps).
+                  const before = Array.isArray(apiMessagesCache) ? apiMessagesCache.length : 0;
+                  await requestChatGPTConversationViaPageContext(convId);
+                  const started = Date.now();
+                  while (Date.now() - started < 8000) {
+                    const nowLen = Array.isArray(apiMessagesCache) ? apiMessagesCache.length : 0;
+                    if (nowLen > before + 50) {
+                      log('ChatGPT page-context fetch yielded messages', { before, nowLen });
+                      setCaptureProgress({
+                        captureId: captureIdActive,
+                        provider: 'chatgpt',
+                        phase: 'api_capture',
+                        status: 'done'
+                      }).catch(() => {});
+                      return;
+                    }
+                    await new Promise((r) => setTimeout(r, 250));
+                  }
+
+                  // Fallback: direct content-script fetch (may 404 depending on deployment / cookies).
+                  log('ChatGPT deep capture: starting backend fetch attempt (fallback)', { convId });
                   const direct = await tryFetchChatGPTConversation(convId);
-                  log('ChatGPT deep capture: backend fetch result', { messages: direct ? direct.length : 0 });
+                  log('ChatGPT deep capture: backend fetch result (fallback)', { messages: direct ? direct.length : 0 });
                   if (direct && direct.length) return;
                 }
 
@@ -2165,6 +3616,14 @@
             const domMsgs = Array.isArray(res[STORAGE_KEYS.CURRENT_MESSAGES]) ? res[STORAGE_KEYS.CURRENT_MESSAGES] : [];
             const apiMsgs = Array.isArray(apiMessagesCache) ? apiMessagesCache : [];
             const messages = apiMsgs.length >= domMsgs.length ? apiMsgs : domMsgs;
+            setCaptureProgress({
+              captureId: captureIdActive,
+              provider,
+              phase: 'done',
+              status: 'done',
+              totalMessages: Array.isArray(messages) ? messages.length : null,
+              receivedMessages: Array.isArray(messages) ? messages.length : 0
+            }).catch(() => {});
             sendResponse({
               ok: true,
               session_id: res[STORAGE_KEYS.CURRENT_SESSION_ID] || null,
@@ -2206,6 +3665,11 @@
   ensureSessionId()
     .then(() => extractExistingMessages())
     .then(() => setupObserver())
+    .then(() => {
+      // On supported sites, show a Crisp-like RL4 launcher (bottom-right).
+      // If the user prefers Side Panel, they can still use it when available.
+      mountInpageWidget();
+    })
     .catch((e) => {
       logError('Initialization failed', e);
       // Debug helper if DOM changed significantly.

@@ -3,7 +3,7 @@
   "name": "RL4 Snapshot — Cross‑LLM Context Export",
   "version": "0.1.0",
   "description": "Export cross-LLM context packages (RCEP™) from Claude, ChatGPT, and Gemini",
-  "permissions": ["storage", "activeTab", "clipboardWrite"],
+  "permissions": ["storage", "activeTab", "clipboardWrite", "sidePanel", "declarativeContent"],
   "host_permissions": [
     "https://claude.ai/*",
     "https://chatgpt.com/*",
@@ -25,21 +25,23 @@
         "https://bard.google.com/*",
         "https://g.co/*"
       ],
-      "js": ["content.js"],
+      "js": ["lib/checksum.js", "lib/extraction.js", "lib/snapshot.js", "content.js"],
       "run_at": "document_start"
     }
   ],
   "action": {
-    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }
   },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
   "web_accessible_resources": [
     {
-      "resources": ["lib/*.js"],
+      "resources": ["lib/*.js", "popup.html", "popup.js", "styles/popup.css", "icons/*.png", "assets/*", "disclaimer.html"],
       "matches": [
         "https://claude.ai/*",
         "https://chatgpt.com/*",

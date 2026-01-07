@@ -13,6 +13,7 @@
     "topics",
     "decisions",
     "timeline_macro",
+    "portable_memory",
     "context_summary_ultra",
     "validation_checklist",
     "unknowns",
@@ -67,6 +68,8 @@
         }
       }
     },
+    "portable_memory": { "type": "object" },
+    "rl4_blocks": { "type": "object" },
     "context_summary_ultra": { "type": "string" },
     "validation_checklist": { "type": "array", "items": { "type": "string" } },
     "unknowns": {

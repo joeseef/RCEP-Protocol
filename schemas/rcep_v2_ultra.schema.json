@@ -13,6 +13,7 @@
     "topics",
     "decisions",
     "timeline_macro",
+    "portable_memory",
     "conversation_fingerprint",
     "metadata",
     "checksum"
@@ -62,6 +63,8 @@
         }
       }
     },
+    "portable_memory": { "type": "object" },
+    "rl4_blocks": { "type": "object" },
     "conversation_fingerprint": {
       "type": "object",
       "required": ["algorithm", "sha256"],

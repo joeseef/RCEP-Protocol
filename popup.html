@@ -17,6 +17,13 @@
           <p class="subtitle">RCEP™ context • Claude + ChatGPT + Gemini • Save context → reuse anywhere</p>
         </div>
       </div>
+      <div class="header-actions">
+        <button id="reloadBtn" class="btn-inline btn-reload" type="button" title="Reset UI for a new run">
+          Reload
+        </button>
+        <!-- Busy indicator (top-right) -->
+        <div id="busySpinner" class="busy-spinner hidden" aria-hidden="true"></div>
+      </div>
     </header>
     
     <main>
@@ -25,25 +32,35 @@
         <input id="urlInput" class="input" type="text" placeholder="Paste a Claude / ChatGPT / Gemini conversation URL" />
       </div>
 
-      <label class="checkbox">
-        <input id="ultraCompress" type="checkbox" checked />
-        <span><strong>Compact</strong> (recommended) — fits most LLMs</span>
-      </label>
+      <div id="optionsWrap" class="options">
+        <div class="options-head">
+          <span class="options-title">Options</span>
+          <button id="optionsToggleBtn" class="btn-inline btn-toggle" type="button" aria-expanded="false">
+            Show
+          </button>
+        </div>
+        <div id="optionsBody" class="options-body hidden">
+          <label class="checkbox">
+            <input id="ultraCompress" type="checkbox" checked />
+            <span><strong>Compact</strong> (recommended) — fits most LLMs</span>
+          </label>
 
-      <label class="checkbox">
-        <input id="semanticHints" type="checkbox" checked />
-        <span><strong>Compact + Meaning</strong> (Ultra+) — adds a tiny summary & checklist (no transcript)</span>
-      </label>
+          <label class="checkbox">
+            <input id="semanticHints" type="checkbox" checked />
+            <span><strong>Compact + Meaning</strong> (Ultra+) — adds a tiny summary & checklist (no transcript)</span>
+          </label>
 
-      <label class="checkbox">
-        <input id="includeTranscript" type="checkbox" />
-        <span><strong>Full transcript</strong> — best fidelity, can be too large</span>
-      </label>
+          <label class="checkbox">
+            <input id="includeTranscript" type="checkbox" />
+            <span><strong>Full transcript</strong> — best fidelity, can be too large</span>
+          </label>
 
-      <label class="checkbox">
-        <input id="integritySeal" type="checkbox" checked />
-        <span><strong>Tamper Seal</strong> (device‑only) — detects edits after export</span>
-      </label>
+          <label class="checkbox">
+            <input id="integritySeal" type="checkbox" checked />
+            <span><strong>Tamper Seal</strong> (device‑only) — detects edits after export</span>
+          </label>
+        </div>
+      </div>
 
       <button id="generateBtn" class="btn-primary">
         Generate Context
@@ -69,8 +86,22 @@
       <div id="postActions" class="hidden">
         <div class="separator">__</div>
 
-        <button id="copyPromptBtn" class="btn-primary">
-          Copy Prompt to Clipboard
+        <button id="copyEncoderPromptBtn" class="btn-primary" type="button">
+          Create finalization prompt
+        </button>
+
+        <div id="rl4BlocksManual" class="hidden">
+          <div class="field" style="margin-top: 8px;">
+            <label class="field-label" for="rl4BlocksInput">Paste LLM response here</label>
+            <textarea id="rl4BlocksInput" class="input" rows="6" placeholder="Paste the assistant reply containing <RL4-ARCH>…</RL4-ARCH> etc."></textarea>
+          </div>
+          <button id="finalizeBlocksBtn" class="btn-secondary" type="button">
+            Finalize Snapshot
+          </button>
+        </div>
+
+        <button id="copyPromptBtn" class="btn-secondary" type="button" disabled>
+          Copy Final Snapshot (into another LLM)
         </button>
 
         <a href="#" id="viewRawBtn" class="link-subtle">View raw JSON</a>
@@ -80,6 +111,9 @@
       <div id="lastPrompt" class="last-prompt hidden">
         <div class="last-prompt-head">
           <span class="last-prompt-title">Last prompt</span>
+          <button id="toggleLastPromptBtn" class="btn-inline btn-toggle" type="button" aria-expanded="false">
+            Show
+          </button>
           <button id="copyLastPromptBtn" class="btn-inline" type="button">📋 Copy</button>
         </div>
         <pre id="lastPromptText" class="last-prompt-text"></pre>
