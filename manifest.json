@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "RL4 Snapshot for Claude",
+  "name": "RL4 Snapshot — Cross‑LLM Context Export",
   "version": "0.1.0",
-  "description": "Capture and compress Claude conversations with deterministic snapshots",
+  "description": "Export cross-LLM context packages (RCEP™) from Claude, ChatGPT, and Gemini",
   "permissions": ["storage", "activeTab", "clipboardWrite"],
   "host_permissions": [
     "https://claude.ai/*",
