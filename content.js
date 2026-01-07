@@ -1999,9 +1999,9 @@
         // Non-share pages: optionally deep capture (scroll) or normal scan (uses storage + interceptor cache).
         const capturePromise = wantsDeep
           ? (async () => {
-              // Hydrate first for reverse infinite scroll UIs (Gemini/ChatGPT/Claude variants).
+              // Hydrate first for reverse infinite scroll UIs (Gemini + ChatGPT).
               const scroller = getConversationScrollContainer(provider);
-              if (provider === 'gemini') {
+              if (provider === 'gemini' || provider === 'chatgpt') {
                 await hydrateChatHistory(scroller, 'hydrate');
               }
               // Then do a full pass capture (top -> bottom) to accumulate DOM-virtualized slices.
