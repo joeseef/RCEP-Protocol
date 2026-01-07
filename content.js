@@ -29,7 +29,9 @@
 
   const SELECTORS = {
     // Claude
-    CLAUDE_MESSAGE_CONTAINERS: '[data-testid*="message"]',
+    // Claude UI changes often; keep selectors broad but still message-oriented.
+    CLAUDE_MESSAGE_CONTAINERS:
+      'div[data-testid*="message"],article[data-testid*="message"],[data-testid^="chat-message"],[data-testid*="chat-message"],[data-testid^="conversation-turn"],article[data-testid^="conversation-turn-"]',
     CLAUDE_USER_MESSAGE: '.font-user-message',
     CLAUDE_ASSISTANT_MESSAGE: '.font-claude-message',
     CLAUDE_ROLE_ATTR: '[data-is-user-message]',
@@ -428,10 +430,10 @@
           jobStrategy = 'dom';
         }
 
-        // Hydrate virtualized UIs for Gemini + ChatGPT (and still safe for others)
+        // Hydrate reverse-infinite-scroll UIs for Gemini + ChatGPT + Claude.
         const scroller = getConversationScrollContainer(provider);
         if (jobStrategy !== 'chatgpt_surgical') {
-          if (provider === 'gemini' || provider === 'chatgpt') {
+          if (provider === 'gemini' || provider === 'chatgpt' || provider === 'claude') {
             // Phase 1/3 (DOM strategy): hydrate
             await emitCaptureProgress(
               {
@@ -2450,7 +2452,18 @@
    * @returns {Promise<void>}
    */
   async function extractExistingMessages() {
-    await scanAndSyncMessages('initial');
+    const provider = getProvider();
+    // Claude can hydrate messages a bit after initial load; retry briefly to avoid capturing only the last turn.
+    const maxRetries = provider === 'claude' ? 12 : 3;
+    for (let i = 0; i < maxRetries; i++) {
+      await scanAndSyncMessages('initial');
+      try {
+        const res = await chrome.storage.local.get([STORAGE_KEYS.CURRENT_MESSAGES]);
+        const msgs = Array.isArray(res[STORAGE_KEYS.CURRENT_MESSAGES]) ? res[STORAGE_KEYS.CURRENT_MESSAGES] : [];
+        if (msgs.length >= 2) return;
+      } catch (_) {}
+      await new Promise((r) => setTimeout(r, 350 + i * 150));
+    }
   }
 
   /**
@@ -2813,9 +2826,20 @@
     const start = Date.now();
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const provider = getProvider();
-    const waitMs = provider === 'chatgpt' ? Math.max(DEEP_HYDRATE_WAIT_MS, 2500) : DEEP_HYDRATE_WAIT_MS;
-    const maxNoGrowth = provider === 'chatgpt' ? 25 : 4;
-    const maxMs = provider === 'chatgpt' ? Math.max(DEEP_HYDRATE_MAX_MS, 420000) : DEEP_HYDRATE_MAX_MS; // up to 7 min
+    const waitMs =
+      provider === 'chatgpt'
+        ? Math.max(DEEP_HYDRATE_WAIT_MS, 2500)
+        : provider === 'claude'
+          ? Math.max(DEEP_HYDRATE_WAIT_MS, 2200)
+          : DEEP_HYDRATE_WAIT_MS;
+    // Claude needs more "no growth" patience than Gemini: it can load chunks slower.
+    const maxNoGrowth = provider === 'chatgpt' ? 25 : provider === 'claude' ? 10 : 4;
+    const maxMs =
+      provider === 'chatgpt'
+        ? Math.max(DEEP_HYDRATE_MAX_MS, 420000)
+        : provider === 'claude'
+          ? Math.max(DEEP_HYDRATE_MAX_MS, 180000)
+          : DEEP_HYDRATE_MAX_MS; // up to 3 min for Claude
     let noGrowth = 0;
 
     const getScrollHeight = () =>
@@ -2842,7 +2866,8 @@
       const step = Math.max(220, Math.floor(viewportH * 0.6));
 
       // ChatGPT: slower pulses seem to trigger chunk loading more reliably than instant "teleport to 0".
-      const pulses = provider === 'chatgpt' ? 14 : 8;
+      // Claude: also benefits from more pulses.
+      const pulses = provider === 'chatgpt' ? 14 : provider === 'claude' ? 12 : 8;
       for (let k = 0; k < pulses; k++) {
         const y = getY();
         const nextY = Math.max(0, y - step);
@@ -2853,6 +2878,7 @@
           if (provider === 'chatgpt') dispatchWheel(document, -step);
         } catch (_) {}
         if (provider === 'chatgpt') await sleep(90);
+        if (provider === 'claude') await sleep(120);
       }
       // Ensure we actually touch the top boundary
       setY(0);
@@ -2937,8 +2963,8 @@
           resolve();
         }, waitMs);
 
-        // ChatGPT often mutates outside the scroll container (react portals). Observe documentElement.
-        const target = provider === 'chatgpt' ? document.documentElement : (scroller || document.documentElement);
+        // ChatGPT + Claude often mutate outside the scroll container (react portals). Observe documentElement.
+        const target = provider === 'chatgpt' || provider === 'claude' ? document.documentElement : (scroller || document.documentElement);
         let obs;
         try {
           obs = new MutationObserver(() => {
@@ -3594,9 +3620,9 @@
                   if (direct && direct.length) return;
                 }
 
-                // Hydrate first for reverse infinite scroll UIs (Gemini + ChatGPT).
+                // Hydrate first for reverse infinite scroll UIs (Gemini + ChatGPT + Claude).
                 const scroller = getConversationScrollContainer(provider);
-                if (provider === 'gemini' || provider === 'chatgpt') {
+                if (provider === 'gemini' || provider === 'chatgpt' || provider === 'claude') {
                   await hydrateChatHistory(scroller, 'hydrate');
                 }
 

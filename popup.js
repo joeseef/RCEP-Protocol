@@ -7,6 +7,7 @@ let currentSnapshot = null;
 let hasSnapshotInThisUiSession = false;
 let cachedLastPrompt = '';
 let optionsExpanded = false;
+let flowSticky = false; // keep Step 2/3 UI visible until Reload
 
 const STORAGE_KEYS = {
   LAST_PROMPT: 'rl4_last_prompt_v1',
@@ -14,7 +15,8 @@ const STORAGE_KEYS = {
   LAST_SNAPSHOT: 'rl4_last_snapshot_v1',
   RL4_BLOCKS: 'rl4_blocks_v1',
   RL4_BLOCKS_STATUS: 'rl4_blocks_status_v1',
-  LAST_SUPPORTED_TAB: 'rl4_last_supported_tab_v1'
+  LAST_SUPPORTED_TAB: 'rl4_last_supported_tab_v1',
+  UI_FLOW: 'rl4_ui_flow_v1'
 };
 
 async function getRememberedSupportedTab() {
@@ -83,12 +85,29 @@ async function loadRl4BlocksStatus() {
   return s;
 }
 
+async function loadUiFlow() {
+  try {
+    const res = await chrome.storage.local.get([STORAGE_KEYS.UI_FLOW]);
+    const v = res && res[STORAGE_KEYS.UI_FLOW] && typeof res[STORAGE_KEYS.UI_FLOW] === 'object' ? res[STORAGE_KEYS.UI_FLOW] : null;
+    return v;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function saveUiFlow(v) {
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEYS.UI_FLOW]: v });
+  } catch (_) {}
+}
+
 function renderRl4BlocksStatus(statusObj) {
   const manualWrap = document.getElementById('rl4BlocksManual');
   const copyFinalBtn = document.getElementById('copyPromptBtn');
   const s = statusObj && typeof statusObj === 'object' ? statusObj : null;
   if (!s || !s.status) {
-    manualWrap?.classList.add('hidden');
+    if (flowSticky) manualWrap?.classList.remove('hidden');
+    else manualWrap?.classList.add('hidden');
     if (copyFinalBtn) copyFinalBtn.disabled = true;
     return;
   }
@@ -100,7 +119,7 @@ function renderRl4BlocksStatus(statusObj) {
     return;
   }
   if (status === 'captured') {
-    manualWrap?.classList.add('hidden');
+    if (!flowSticky) manualWrap?.classList.add('hidden');
     if (copyFinalBtn) copyFinalBtn.disabled = true;
     return;
   }
@@ -316,6 +335,10 @@ function resetUiForNewRun() {
     stopRl4BlocksPoll();
   } catch (_) {}
 
+  // Reset sticky sequence state.
+  flowSticky = false;
+  saveUiFlow({ active: false, step: 'reset', updatedAt: Date.now() }).catch(() => {});
+
   hasSnapshotInThisUiSession = false;
   currentSnapshot = null;
 
@@ -444,6 +467,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   setOptionsExpanded(false);
   refreshGuidance().catch(() => {});
 
+  // Restore sticky flow state (sequence must not "stop" until Reload).
+  try {
+    const f = await loadUiFlow();
+    if (f && f.active === true) {
+      flowSticky = true;
+      // If user was in the middle of Step 2/3, keep the paste container visible.
+      document.getElementById('rl4BlocksManual')?.classList.remove('hidden');
+    }
+  } catch (_) {}
+
   reloadBtn?.addEventListener('click', (e) => {
     e.preventDefault();
     resetUiForNewRun();
@@ -564,6 +597,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       const prompt = buildRl4BlocksEncoderPrompt(currentSnapshot);
       await copyToClipboard(prompt);
 
+      // Sticky sequence: once Step 2 starts, keep Step 3 visible until Reload.
+      flowSticky = true;
+      saveUiFlow({ active: true, step: 'await_response', updatedAt: Date.now() }).catch(() => {});
+
       // Arm content script: capture <RL4-...> blocks from the next assistant reply.
       const tab = await getTargetActiveTab();
       if (tab && typeof tab.id === 'number') {
@@ -631,6 +668,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               if (snap) currentSnapshot = snap;
               showStatus('success', 'Step 3/ Finalized.\n\nStep 4/ Copy the final snapshot into another LLM.');
               updateMetadata(currentSnapshot);
+              saveUiFlow({ active: true, step: 'sealed', updatedAt: Date.now() }).catch(() => {});
               refreshGuidance().catch(() => {});
             }
           });
