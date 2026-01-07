@@ -1180,6 +1180,8 @@ function updateMetadata(snapshot) {
   checksumEl.textContent = snapshot.checksum ? snapshot.checksum.substring(0, 16) + '...' : '-';
 
   metadataDiv.classList.remove('hidden');
+  // If a previous "Reload" forced display:none, undo it.
+  metadataDiv.style.display = '';
 }
 
 /**
